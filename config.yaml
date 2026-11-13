@@ -1,0 +1,18 @@
+# ==============================================================================
+# LangMind <-> XiaoZhi ESP32 Bridge Server Configuration
+# ==============================================================================
+
+server:
+  host: "0.0.0.0"       # ฟังทุก IP ในเครื่อง
+  port: 8000            # พอร์ตของ Server
+  public_url: ""        # หากปล่อยว่าง ระบบจะตรวจจับ Local IP ของเครื่องให้อัตโนมัติ
+
+langmind:
+  base_url: "https://langmind.in.th/api"
+  api_key: "lmpat_OEHYT_yl79bXI6Zw-ZWBeFQ7a-y-tTs_76hEvvnxzK4"   # ใส่ Personal API Key จาก LangMind
+  agent_id: "e2fe0242-6e05-4460-b846-1fab2f8df2e9"          # ใส่ Agent ID ที่ต้องการคุยด้วย
+  voice_speed: 1.0                            # ความเร็วเสียง (ค่าเริ่มต้น 1.0)
+
+audio:
+  sample_rate: 16000                          # อัตราสุ่มสัญญาณเสียง 16kHz
+  frame_duration_ms: 60                       # ระยะเวลาต่อเฟรม Opus (60ms มาตรฐานเสี่ยวจื้อ)
