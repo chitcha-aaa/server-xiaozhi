@@ -318,38 +318,61 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info(f"[{session_id}] STT ok ({len(transcribed_text)} chars, {time.monotonic() - t0:.1f}s)"
                         + (f": {transcribed_text!r}" if LOG_CONVERSATION else ""))
 
-            # 2. Chat (conversation_id keeps context across turns and reconnects)
-            try:
-                answer_text, new_conv = await langmind.chat(VOICE_PREFIX + transcribed_text, conversation_id)
-            except Exception as e:
-                logger.error(f"[{session_id}] Chat failed: {e}")
-                await fail(st.STATUS_ERROR_LLM)
-                return
-            if new_conv:
-                conversation_id = new_conv
-                _put_conversation(device_id, conversation_id)
-            if stale():
-                return
-            answer_text = st.strip_greeting(answer_text or "")
-            chunks = st.split_for_tts(answer_text)
-            if not chunks:
-                await fail(st.STATUS_ERROR_LLM)
-                return
-            logger.info(f"[{session_id}] Chat ok ({len(answer_text)} chars -> {len(chunks)} TTS chunks, "
-                        f"{time.monotonic() - t0:.1f}s)" + (f": {answer_text!r}" if LOG_CONVERSATION else ""))
+            t_stt = time.monotonic() - t0
 
-            # 3. TTS chunk by chunk; fetch the next chunk while the current one plays.
+            # 2+3. Chat streaming -> TTS per chunk as soon as a phrase is ready -> ordered playback.
+            # (conversation_id keeps context across turns and reconnects)
+            tts_tasks: asyncio.Queue = asyncio.Queue()  # ordered TTS tasks; None = end of answer
+            tts_limit = asyncio.Semaphore(2)            # at most 2 TTS requests in flight
+            answer_parts: list[str] = []
+            chat_error: list[Exception] = []
+            marks: dict[str, float] = {}
+
+            async def tts_limited(text: str) -> list[bytes]:
+                async with tts_limit:
+                    return await tts_chunk(text)
+
+            async def producer():
+                nonlocal conversation_id
+                chunker = st.StreamChunker()
+                try:
+                    async for kind, value in langmind.chat_stream(VOICE_PREFIX + transcribed_text, conversation_id):
+                        if kind == "conv":
+                            if value != conversation_id:
+                                conversation_id = value
+                                _put_conversation(device_id, conversation_id)
+                            continue
+                        marks.setdefault("token", time.monotonic() - t0)
+                        answer_parts.append(value)
+                        for chunk in chunker.feed(value):
+                            marks.setdefault("chunk", time.monotonic() - t0)
+                            tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk)))
+                        if stale():
+                            return
+                    for chunk in chunker.flush():
+                        marks.setdefault("chunk", time.monotonic() - t0)
+                        tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk)))
+                except Exception as e:
+                    chat_error.append(e)
+                finally:
+                    tts_tasks.put_nowait(None)
+
+            prefetch = asyncio.create_task(producer())
             is_speaking = True
             started = False
-            prefetch = asyncio.create_task(tts_chunk(chunks[0]))
-            for i in range(len(chunks)):
+            spoken = 0
+            while True:
+                task = await tts_tasks.get()
+                if task is None:
+                    break
                 try:
-                    packets = await prefetch
+                    packets = await task
                 except Exception as e:
-                    logger.error(f"[{session_id}] TTS failed on chunk {i + 1}: {e}")
+                    logger.error(f"[{session_id}] TTS failed on chunk {spoken + 1}: {e}")
                     packets = []
-                prefetch = asyncio.create_task(tts_chunk(chunks[i + 1])) if i + 1 < len(chunks) else None
+                spoken += 1
                 if stale():
+                    task.cancel()
                     break
                 if not packets:
                     if not started:
@@ -358,7 +381,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 if not started:
                     started = True
-                    logger.info(f"[{session_id}] 🔊 First audio after {time.monotonic() - t0:.1f}s")
+                    logger.info(f"[{session_id}] 🔊 First audio after {time.monotonic() - t0:.1f}s "
+                                f"(STT {t_stt:.1f}s, first token {marks.get('token', 0):.1f}s, "
+                                f"first chunk {marks.get('chunk', 0):.1f}s)")
                     await send_json({"session_id": session_id, "type": "tts", "state": "start"})
                     await send_status(st.STATUS_SPEAKING, "happy")
                 for pkt in packets:
@@ -371,8 +396,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         mark_disconnected()
                         break
                     await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
+            # drop any TTS still queued after an interrupt
+            while not tts_tasks.empty():
+                t = tts_tasks.get_nowait()
+                if t is not None:
+                    t.cancel()
+            answer_text = "".join(answer_parts)
+            if answer_text or chat_error:
+                logger.info(f"[{session_id}] Chat done ({len(answer_text)} chars, {spoken} chunks)"
+                            + (f": {answer_text!r}" if LOG_CONVERSATION else ""))
+            if chat_error:
+                logger.error(f"[{session_id}] Chat failed: {chat_error[0]}")
             if stale():
                 logger.info(f"[{session_id}] Playback interrupted")
+            elif not started:
+                await fail(st.STATUS_ERROR_LLM if (chat_error or not answer_text) else st.STATUS_ERROR_TTS)
             else:
                 await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
 
@@ -453,13 +491,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # 1. Max speech duration -> trigger response
                 if len(audio_buffer) >= MAX_SPEECH_PACKETS:
-                    logger.info(f"[{session_id}] ⏳ Max speech duration reached ({MAX_SPEECH_SEC:.0f}s). Processing speech...")
+                    if not processing_queued:
+                        logger.info(f"[{session_id}] ⏳ Max speech duration reached ({MAX_SPEECH_SEC:.0f}s). Processing speech...")
                     trigger_speech_processing()
                     continue
 
                 # 2. Check for speech and trailing silence once buffer reaches at least 25 packets (~1.5s)
                 # and check every 8 packets (~480ms)
-                if len(audio_buffer) >= 25 and (len(audio_buffer) - last_check_packet_count) >= 8:
+                if len(audio_buffer) >= 15 and (len(audio_buffer) - last_check_packet_count) >= 4:
                     last_check_packet_count = len(audio_buffer)
                     current_packets = list(audio_buffer)
                     wav_check = await asyncio.to_thread(opus_packets_to_wav, current_packets, SAMPLE_RATE)

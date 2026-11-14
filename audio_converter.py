@@ -8,6 +8,8 @@ import webrtcvad
 
 logger = logging.getLogger("AudioConverter")
 _vad = webrtcvad.Vad(2)
+# End-of-speech = this much trailing silence. 25 x 20 ms = 500 ms (was 700 ms).
+TRAILING_FRAMES = 25
 
 # Precomputed CRC table for Ogg
 _CRC_LOOKUP = [0] * 256
@@ -195,7 +197,7 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
             speech_frames += 1
 
     # Check trailing ~700ms (last 35 frames of 20ms)
-    trailing_frames = min(35, num_frames)
+    trailing_frames = min(TRAILING_FRAMES, num_frames)  # 20 ms frames
     trailing_pcm = pcm[-trailing_frames * 640 :]
     trailing_speech = sum(
         1 for i in range(0, trailing_frames * 640, 640) if _vad.is_speech(trailing_pcm[i : i + 640], 16000)

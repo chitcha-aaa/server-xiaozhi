@@ -44,6 +44,77 @@ def strip_greeting(text: str) -> str:
     return rest if len(rest) >= 8 else text
 
 
+class StreamChunker:
+    """Turns streamed LLM text deltas into TTS chunks as early as possible.
+
+    The first chunk is cut at the first phrase break after FIRST_MIN chars (short text =
+    fast TTS = fast first audio). Later chunks are longer so playback stays smooth.
+    A leading greeting ("สวัสดีค่ะ ...") is dropped before anything is spoken.
+    """
+    FIRST_MIN, FIRST_MAX = 12, 40
+    NEXT_MIN, NEXT_MAX = 50, 140
+    _BREAK = re.compile(r"[\s,.!?;:、。！？\n]")
+
+    def __init__(self):
+        self.buf = ""
+        self.emitted = 0
+        self.greeting_checked = False
+
+    def _cut(self, lo: int, hi: int) -> str | None:
+        text = self.buf
+        if len(text) < lo:
+            return None
+        # last break point in [lo, hi]; else first break after lo; else hard cut at hi
+        window = text[:hi + 1]
+        pos = max((m.end() for m in self._BREAK.finditer(window) if m.end() >= lo), default=None)
+        if pos is None:
+            m = self._BREAK.search(text, lo)
+            if m:
+                pos = m.end()
+            elif len(text) > hi * 2:  # never cut a Thai word unless the run is very long
+                pos = hi * 2
+            else:
+                return None
+        chunk, self.buf = text[:pos], text[pos:]
+        return chunk
+
+    def feed(self, delta: str) -> list[str]:
+        self.buf += delta
+        if not self.greeting_checked:
+            # Decide on a greeting only once a phrase break has arrived, so a partial
+            # token like "สวัสดี" (before "ค่ะ") isn't cut in half.
+            if not self._BREAK.search(self.buf.lstrip()):
+                return []
+            stripped = _GREETING.sub("", self.buf, count=1).lstrip()
+            if stripped != self.buf.lstrip():
+                if not stripped:
+                    return []  # only greeting so far: wait for real content
+                self.buf = stripped
+            if len(self.buf) >= self.FIRST_MIN:
+                self.greeting_checked = True
+            else:
+                return []
+        out = []
+        while True:
+            lo, hi = (self.FIRST_MIN, self.FIRST_MAX) if self.emitted == 0 else (self.NEXT_MIN, self.NEXT_MAX)
+            chunk = self._cut(lo, hi)
+            if chunk is None:
+                break
+            chunk = clean_for_speech(chunk)
+            if chunk:
+                out.append(chunk)
+                self.emitted += 1
+        return out
+
+    def flush(self) -> list[str]:
+        rest = clean_for_speech(self.buf)
+        self.buf = ""
+        if rest:
+            self.emitted += 1
+            return [rest]
+        return []
+
+
 def split_for_tts(text: str, max_len: int = 120) -> list[str]:
     """Split into speakable chunks. The first chunk is kept short so audio starts sooner.
 
