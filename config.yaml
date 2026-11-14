@@ -6,6 +6,7 @@ server:
   host: "0.0.0.0"       # ฟังทุก IP ในเครื่อง
   port: 8000            # พอร์ตของ Server
   public_url: ""        # หากปล่อยว่าง ระบบจะตรวจจับ Local IP ของเครื่องให้อัตโนมัติ
+  log_conversation: true  # แสดงคำพูด/คำตอบใน log บนคอม (ไม่ส่งไปจอ) — ปิดเป็น false เมื่อใช้งานจริง
 
 langmind:
   base_url: "https://langmind.in.th/api"

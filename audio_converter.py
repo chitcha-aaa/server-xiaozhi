@@ -203,7 +203,9 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
     trailing_speech_ratio = trailing_speech / trailing_frames if trailing_frames > 0 else 0
     overall_speech_ratio = speech_frames / num_frames if num_frames > 0 else 0
 
-    has_speech = (overall_speech_ratio >= 0.18 and rms >= 300) or rms >= 600
+    # Loudness alone is not speech: a fan/room noise at RMS ~800 used to trigger empty STT calls
+    # every second. Require a real VAD speech share, and more of it when it's quiet.
+    has_speech = (overall_speech_ratio >= 0.30 and rms >= 300) or (overall_speech_ratio >= 0.15 and rms >= 1500)
     trailing_silent = trailing_speech_ratio < 0.20
 
     return {

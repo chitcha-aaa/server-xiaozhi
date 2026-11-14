@@ -29,24 +29,32 @@ class LangMindClient:
             "audio": ("audio.wav", wav_bytes, "audio/wav")
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+        # Raises on API failure so the caller can show "Error: speech API" instead of
+        # pretending the user said nothing. One retry on 5xx / network errors.
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for attempt in (1, 2):
                 logger.info(f"Calling LangMind STT: {url} ({len(wav_bytes)} bytes)")
-                res = await client.post(url, headers=headers, files=files)
+                try:
+                    res = await client.post(url, headers=headers, files=files)
+                except httpx.HTTPError as e:
+                    if attempt == 1:
+                        logger.warning(f"LangMind STT network error, retrying: {e}")
+                        continue
+                    raise RuntimeError(f"STT network error: {e}") from e
+                if res.status_code >= 500 and attempt == 1:
+                    logger.warning(f"LangMind STT [{res.status_code}], retrying once")
+                    continue
                 if res.status_code != 200:
-                    logger.error(f"LangMind STT Error [{res.status_code}]: {res.text}")
-                    return ""
-                
-                data = res.json()
-                # Expected format: {"text": "...", "elapsed_ms": ...} or {"data": {"text": "..."}}
-                if isinstance(data, dict):
-                    if "text" in data:
-                        return data["text"]
-                    if "data" in data and isinstance(data["data"], dict) and "text" in data["data"]:
-                        return data["data"]["text"]
-                return ""
-        except Exception as e:
-            logger.error(f"Exception during LangMind transcribe: {e}")
+                    raise RuntimeError(f"STT HTTP {res.status_code}: {res.text[:200]}")
+                break
+
+            data = res.json()
+            # Expected format: {"text": "...", "elapsed_ms": ...} or {"data": {"text": "..."}}
+            if isinstance(data, dict):
+                if "text" in data:
+                    return data["text"]
+                if "data" in data and isinstance(data["data"], dict) and "text" in data["data"]:
+                    return data["data"]["text"]
             return ""
 
     async def chat(self, query: str, conversation_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
@@ -68,7 +76,7 @@ class LangMindClient:
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.info(f"Calling LangMind Chat: {url} | query: {query}")
+                logger.info(f"Calling LangMind Chat: {url} ({len(query)} chars)")
                 res = await client.post(url, headers=headers, json=payload)
                 
                 # If /chat/message/blocking is not implemented, try /chat/message
@@ -81,7 +89,7 @@ class LangMindClient:
                     return f"ขออภัย เกิดข้อผิดพลาดจาก LangMind (รหัส {res.status_code})", conversation_id
 
                 data = res.json()
-                logger.info(f"LangMind Chat response: {data}")
+                logger.debug(f"LangMind Chat response: {data}")
 
                 # Extract answer text and conversation_id
                 answer = ""
