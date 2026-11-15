@@ -31,7 +31,7 @@ def _getaddrinfo(host, *args, **kwargs):
     except socket.gaierror:
         cached = _dns_cache.get(key) if name in _cached_hosts else None
         if cached:
-            logger.warning(f"DNS lookup for {host} failed; using cached address")
+            logger.warning("DNS lookup failed; using cached address")
             return cached
         raise
 
@@ -66,6 +66,10 @@ class LangMindClient:
             )
         return self._client
 
+    async def aclose(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
     def _headers(self) -> dict:
         return {
             "Authorization": f"Bearer {self.api_key}",
@@ -78,12 +82,12 @@ class LangMindClient:
         for attempt in range(len(RETRY_DELAYS) + 1):
             try:
                 res = await self._http().post(url, headers=self._headers() | kwargs.pop("extra_headers", {}), **kwargs)
-            except httpx.HTTPError as e:
-                last = f"network error: {e or type(e).__name__}"
+            except httpx.HTTPError:
+                last = "network error"
             else:
                 if res.status_code < 500:
                     if res.status_code != 200:
-                        raise LangMindError(f"{name} HTTP {res.status_code}: {res.text[:200]}")
+                        raise LangMindError(f"{name} HTTP {res.status_code}")
                     return res
                 last = f"HTTP {res.status_code}"
             if attempt < len(RETRY_DELAYS):
@@ -94,7 +98,7 @@ class LangMindClient:
     async def transcribe(self, wav_bytes: bytes) -> str:
         """POST /v1/agents/{agent_id}/voice/transcribe. Raises on API failure."""
         url = f"{self.base_url}/v1/agents/{self.agent_id}/voice/transcribe"
-        logger.info(f"Calling LangMind STT ({len(wav_bytes)} bytes)")
+        logger.info("Calling LangMind STT")
         res = await self._post("STT", url, files={"audio": ("audio.wav", wav_bytes, "audio/wav")})
         data = res.json()
         if isinstance(data, dict):
@@ -109,7 +113,7 @@ class LangMindClient:
         url = f"{self.base_url}/chat/message/blocking"
         payload = {"agent_id": self.agent_id, "query": query,
                    "conversation_id": conversation_id, "attachment_ids": []}
-        logger.info(f"Calling LangMind Chat ({len(query)} chars)")
+        logger.info("Calling LangMind Chat")
         try:
             res = await self._post("Chat", url, json=payload)
         except LangMindError as e:
@@ -118,7 +122,6 @@ class LangMindClient:
                 return await self._chat_stream(query, conversation_id)
             raise
         data = res.json()
-        logger.debug(f"LangMind Chat response: {data}")
         answer, new_conv_id = "", conversation_id
         if isinstance(data, dict):
             inner = data.get("data") if isinstance(data.get("data"), dict) else data
@@ -134,7 +137,7 @@ class LangMindClient:
         headers = {**self._headers(), "Accept": "text/event-stream"}
         payload = {"agent_id": self.agent_id, "query": query,
                    "conversation_id": conversation_id, "attachment_ids": []}
-        logger.info(f"Calling LangMind Chat stream ({len(query)} chars)")
+        logger.info("Calling LangMind Chat stream")
         last = ""
         for attempt in range(len(RETRY_DELAYS) + 1):
             got_text = False
@@ -143,8 +146,7 @@ class LangMindClient:
                     if resp.status_code >= 500:
                         last = f"HTTP {resp.status_code}"
                     elif resp.status_code != 200:
-                        body = (await resp.aread()).decode("utf-8", "replace")
-                        raise LangMindError(f"Chat HTTP {resp.status_code}: {body[:200]}")
+                        raise LangMindError(f"Chat HTTP {resp.status_code}")
                     else:
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
@@ -163,13 +165,13 @@ class LangMindClient:
                                 got_text = True
                                 yield ("text", ev["answer"])
                             elif kind in ("error",):
-                                raise LangMindError(f"Chat stream error event: {str(ev)[:200]}")
+                                raise LangMindError("Chat stream provider error")
                         return
-            except httpx.HTTPError as e:
+            except httpx.HTTPError:
                 if got_text:  # mid-answer drop: keep what was spoken, stop here
-                    logger.warning(f"Chat stream dropped mid-answer: {e}")
+                    logger.warning("Chat stream dropped mid-answer")
                     return
-                last = f"network error: {e or type(e).__name__}"
+                last = "network error"
             if attempt < len(RETRY_DELAYS):
                 logger.warning(f"LangMind Chat stream {last}; retry {attempt + 1}/{len(RETRY_DELAYS)}")
                 await asyncio.sleep(RETRY_DELAYS[attempt])
@@ -199,18 +201,18 @@ class LangMindClient:
                         chunks.append(ev["message"])
                     elif "text" in ev:
                         chunks.append(ev["text"])
-        except httpx.HTTPError as e:
-            raise LangMindError(f"Chat stream network error: {e}") from e
+        except httpx.HTTPError as exc:
+            raise LangMindError("Chat stream network error") from exc
         return "".join(chunks), new_conv_id
 
     async def speech(self, text: str) -> bytes:
         """POST /v1/agents/{agent_id}/voice/speech. Returns b'' on failure (caller shows voice error)."""
         url = f"{self.base_url}/v1/agents/{self.agent_id}/voice/speech"
         payload = {"text": text, "speed": self.voice_speed, "format": "wav"}
-        logger.info(f"Calling LangMind TTS ({len(text)} chars)")
+        logger.info("Calling LangMind TTS")
         try:
             res = await self._post("TTS", url, json=payload)
             return res.content
-        except LangMindError as e:
-            logger.error(str(e))
+        except LangMindError:
+            logger.error("LangMind TTS request failed")
             return b""

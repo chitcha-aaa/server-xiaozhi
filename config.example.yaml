@@ -1,0 +1,15 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+  public_url: ""
+  conversation_ttl_sec: 600
+
+langmind:
+  base_url: "https://langmind.in.th/api"
+  agent_id: ""
+  voice_speed: 1.0
+
+audio:
+  sample_rate: 16000
+  frame_duration_ms: 60
+  max_speech_sec: 10
