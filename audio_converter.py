@@ -1,8 +1,6 @@
-import os
 import math
 import struct
 import subprocess
-import tempfile
 import logging
 import webrtcvad
 
@@ -81,32 +79,21 @@ def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes
 
     ogg_data = b"".join(pages)
 
-    with tempfile.NamedTemporaryFile(suffix=".opus", delete=False) as f_in:
-        in_path = f_in.name
-        f_in.write(ogg_data)
-
-    out_path = in_path + ".wav"
     try:
         res = subprocess.run(
-            ["ffmpeg", "-y", "-i", in_path, "-ar", str(sample_rate), "-ac", "1", out_path],
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "ogg", "-i", "pipe:0",
+             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "pipe:1"],
+            input=ogg_data,
             capture_output=True,
+            timeout=30,
         )
-        if res.returncode == 0 and os.path.exists(out_path):
-            with open(out_path, "rb") as f_out:
-                return f_out.read()
-        logger.error(f"FFmpeg failed converting Opus to WAV: {res.stderr.decode('utf-8', errors='ignore')}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("FFmpeg Opus-to-WAV conversion failed (%s)", type(exc).__name__)
         return b""
-    finally:
-        if os.path.exists(in_path):
-            try:
-                os.remove(in_path)
-            except OSError:
-                pass
-        if os.path.exists(out_path):
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
+    if res.returncode == 0 and res.stdout:
+        return res.stdout
+    logger.error("FFmpeg Opus-to-WAV conversion failed")
+    return b""
 
 
 def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_duration_ms: int = 60) -> list[bytes]:
@@ -114,63 +101,56 @@ def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_du
     if not audio_bytes:
         return []
 
-    with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as f_in:
-        in_path = f_in.name
-        f_in.write(audio_bytes)
-
-    out_path = in_path + ".opus"
     try:
         res = subprocess.run(
             [
-                "ffmpeg", "-y", "-i", in_path,
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
                 "-c:a", "libopus",
                 "-ar", str(sample_rate),
                 "-ac", "1",
                 "-b:a", "24k",
                 "-frame_duration", str(frame_duration_ms),
                 "-f", "ogg",
-                out_path,
+                "pipe:1",
             ],
+            input=audio_bytes,
             capture_output=True,
+            timeout=30,
         )
-        if res.returncode != 0 or not os.path.exists(out_path):
-            logger.error(f"FFmpeg failed converting audio to Opus: {res.stderr.decode('utf-8', errors='ignore')}")
-            return []
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("FFmpeg audio-to-Opus conversion failed (%s)", type(exc).__name__)
+        return []
+    if res.returncode != 0 or not res.stdout:
+        logger.error("FFmpeg audio-to-Opus conversion failed")
+        return []
 
-        with open(out_path, "rb") as f_out:
-            data = f_out.read()
+    # Parse Ogg Opus packets
+    data = res.stdout
+    pos = 0
+    packets = []
+    current_packet = bytearray()
+    while pos < len(data):
+        if data[pos:pos + 4] != b"OggS" or pos + 27 > len(data):
+            break
+        num_segments = data[pos + 26]
+        seg_end = pos + 27 + num_segments
+        if seg_end > len(data):
+            break
+        seg_table = data[pos + 27:seg_end]
+        body_pos = seg_end
+        for seg_len in seg_table:
+            next_pos = body_pos + seg_len
+            if next_pos > len(data):
+                return []
+            current_packet.extend(data[body_pos:next_pos])
+            body_pos = next_pos
+            if seg_len < 255:
+                packets.append(bytes(current_packet))
+                current_packet = bytearray()
+        pos = body_pos
 
-        # Parse Ogg Opus packets
-        pos = 0
-        packets = []
-        current_packet = bytearray()
-        while pos < len(data):
-            if data[pos:pos + 4] != b"OggS":
-                break
-            num_segments = data[pos + 26]
-            seg_table = data[pos + 27:pos + 27 + num_segments]
-            body_pos = pos + 27 + num_segments
-            for seg_len in seg_table:
-                current_packet.extend(data[body_pos:body_pos + seg_len])
-                body_pos += seg_len
-                if seg_len < 255:
-                    packets.append(bytes(current_packet))
-                    current_packet = bytearray()
-            pos = body_pos
-
-        # Packets[0] is OpusHead, Packets[1] is OpusTags, Packets[2:] are the audio packets
-        return packets[2:]
-    finally:
-        if os.path.exists(in_path):
-            try:
-                os.remove(in_path)
-            except OSError:
-                pass
-        if os.path.exists(out_path):
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
+    # Packets[0] is OpusHead, Packets[1] is OpusTags, Packets[2:] are the audio packets
+    return packets[2:]
 
 
 def check_voice_activity(wav_bytes: bytes) -> dict:

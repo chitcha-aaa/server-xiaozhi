@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -8,8 +9,9 @@ import time
 import uuid
 import yaml
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -54,29 +56,29 @@ def get_local_ip() -> str:
         s.close()
 
 
-# Load Configuration
+# Load non-secret configuration. Credentials come from the process environment.
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
-if not os.path.exists(CONFIG_PATH):
-    logger.error(f"Configuration file not found at {CONFIG_PATH}")
-    sys.exit(1)
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+else:
+    config = {}
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    config = yaml.safe_load(f)
-
+APP_ENV = os.environ.get("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
 SERVER_HOST = config.get("server", {}).get("host", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("XIAOZHI_PORT") or config.get("server", {}).get("port", 8000))
-PUBLIC_URL = config.get("server", {}).get("public_url", "").strip()
+SERVER_PORT = int(os.environ.get("PORT") or os.environ.get("XIAOZHI_PORT") or config.get("server", {}).get("port", 8000))
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or config.get("server", {}).get("public_url", "")).strip()
 
-LANGMIND_BASE_URL = config.get("langmind", {}).get("base_url", "https://langmind.in.th/api")
-LANGMIND_API_KEY = config.get("langmind", {}).get("api_key", "").strip()
-LANGMIND_AGENT_ID = config.get("langmind", {}).get("agent_id", "").strip()
-VOICE_SPEED = float(config.get("langmind", {}).get("voice_speed", 1.0))
+LANGMIND_BASE_URL = os.environ.get("LANGMIND_BASE_URL", config.get("langmind", {}).get("base_url", "https://langmind.in.th/api")).strip()
+LANGMIND_API_KEY = os.environ.get("LANGMIND_API_KEY", "").strip()
+LANGMIND_AGENT_ID = (os.environ.get("LANGMIND_AGENT_ID") or config.get("langmind", {}).get("agent_id", "")).strip()
+DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "").strip()
+VOICE_SPEED = float(os.environ.get("VOICE_SPEED") or config.get("langmind", {}).get("voice_speed", 1.0))
 
 SAMPLE_RATE = int(config.get("audio", {}).get("sample_rate", 16000))
 FRAME_DURATION_MS = int(config.get("audio", {}).get("frame_duration_ms", 60))
 
-# Privacy: conversation text is not logged unless explicitly enabled for debugging.
-LOG_CONVERSATION = bool(config.get("server", {}).get("log_conversation", False))
 # Keep a device's LangMind conversation across Wi-Fi/WebSocket reconnects for this long (seconds).
 # A board reboot that stays offline longer than this starts a fresh conversation.
 CONVERSATION_TTL = int(config.get("server", {}).get("conversation_ttl_sec", 600))
@@ -90,14 +92,61 @@ VOICE_PREFIX = config.get("langmind", {}).get(
 MAX_SPEECH_SEC = float(config.get("audio", {}).get("max_speech_sec", 10))
 MAX_SPEECH_PACKETS = int(MAX_SPEECH_SEC * 1000 / int(config.get("audio", {}).get("frame_duration_ms", 60)))
 
-# Voice barge-in tuning (see websocket handler). Defaults calibrated loosely; watch "barge check" logs.
-BARGE_SPEECH_RATIO = float(config.get("audio", {}).get("barge_speech_ratio", 0.5))
-BARGE_RMS = float(config.get("audio", {}).get("barge_rms", 900))          # absolute floor
-BARGE_FACTOR = float(config.get("audio", {}).get("barge_echo_factor", 1.8))  # x speaker-echo level
-BARGE_LEARN_WINDOWS = int(config.get("audio", {}).get("barge_learn_windows", 3))
-BARGE_DEBUG = bool(config.get("audio", {}).get("barge_debug", False))
 _conversations: dict[str, tuple[str, float]] = {}  # device_id -> (conversation_id, last_used)
 _MAX_CONVERSATIONS = 200
+
+
+def _runtime_ready() -> bool:
+    if not (LANGMIND_API_KEY and LANGMIND_AGENT_ID) or len(DEVICE_TOKEN) < 32:
+        return False
+    if IS_PRODUCTION:
+        parsed = _parse_websocket_url(PUBLIC_URL)
+        try:
+            langmind_url = urlsplit(LANGMIND_BASE_URL)
+            _ = langmind_url.port
+        except ValueError:
+            return False
+        return (
+            parsed is not None
+            and parsed.scheme == "wss"
+            and langmind_url.scheme == "https"
+            and bool(langmind_url.netloc)
+            and not langmind_url.username
+            and not langmind_url.password
+            and not langmind_url.query
+            and not langmind_url.fragment
+        )
+    return True
+
+
+def _parse_websocket_url(value: str):
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return None
+    valid = (
+        parsed.scheme in {"ws", "wss"}
+        and bool(parsed.netloc)
+        and parsed.path == "/ws"
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+    )
+    return parsed if valid else None
+
+
+def _websocket_url(request: Request) -> str:
+    if PUBLIC_URL:
+        parsed = _parse_websocket_url(PUBLIC_URL)
+        if parsed is None or (IS_PRODUCTION and parsed.scheme != "wss"):
+            raise HTTPException(status_code=503, detail="WebSocket endpoint is not configured")
+        return PUBLIC_URL
+    if IS_PRODUCTION:
+        raise HTTPException(status_code=503, detail="WebSocket endpoint is not configured")
+    host = request.headers.get("host") or f"{get_local_ip()}:{SERVER_PORT}"
+    return f"ws://{host}/ws"
 
 
 def _get_conversation(device_id: str):
@@ -126,21 +175,21 @@ langmind = LangMindClient(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    local_ip = get_local_ip()
-    ws_host = PUBLIC_URL if PUBLIC_URL else f"{local_ip}:{SERVER_PORT}"
-    print("\n" + "=" * 65, flush=True)
-    print("  🚀 XiaoZhi <-> LangMind Bridge Server is running!", flush=True)
-    print("=" * 65, flush=True)
-    print(f"  • Local IP:         {local_ip}", flush=True)
-    print(f"  • Server Port:      {SERVER_PORT}", flush=True)
-    print(f"  • OTA URL for ESP32: http://{ws_host}/ota/", flush=True)
-    print(f"  • WebSocket URL:    ws://{ws_host}/ws", flush=True)
-    print(f"  • LangMind Agent:   {LANGMIND_AGENT_ID if LANGMIND_AGENT_ID != 'YOUR_LANGMIND_AGENT_ID' else '[⚠️ NOT SET IN config.yaml]'}", flush=True)
-    print("=" * 65 + "\n", flush=True)
-    yield
+    logger.info("Bridge server started; runtime_ready=%s", _runtime_ready())
+    try:
+        yield
+    finally:
+        await langmind.aclose()
 
 
 app = FastAPI(title="XiaoZhi-LangMind Bridge", lifespan=lifespan)
+
+
+@app.get("/healthz")
+async def healthz():
+    if not _runtime_ready():
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    return {"status": "ready"}
 
 
 @app.api_route("/ota/", methods=["GET", "POST"])
@@ -150,18 +199,16 @@ async def ota_endpoint(request: Request):
     OTA endpoint called by XiaoZhi ESP32 on boot/network connection.
     Returns the WebSocket endpoint where the device should connect.
     """
-    host = request.headers.get("host") or f"{get_local_ip()}:{SERVER_PORT}"
-    ws_url = f"ws://{host}/ws"
-    if PUBLIC_URL:
-        ws_url = f"ws://{PUBLIC_URL}/ws" if not PUBLIC_URL.startswith("ws") else PUBLIC_URL
-
-    logger.info(f"ESP32 OTA check from {request.client.host} -> telling device to connect to {ws_url}")
+    if not _runtime_ready():
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    ws_url = _websocket_url(request)
+    logger.info("OTA configuration requested")
 
     # Firmware calls /ota/ only on boot (not on Wi-Fi/WebSocket reconnect), so this marks a
     # board restart: start a fresh LangMind conversation for this device.
     device_id = request.headers.get("device-id")
-    if device_id and _conversations.pop(device_id, None):
-        logger.info(f"Device {device_id} rebooted -> new conversation")
+    if device_id:
+        _conversations.pop(device_id, None)
 
     return JSONResponse(
         content={
@@ -179,28 +226,28 @@ async def ota_endpoint(request: Request):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    authorization = websocket.headers.get("authorization", "")
+    scheme, _, supplied_token = authorization.partition(" ")
+    if not _runtime_ready():
+        await websocket.close(code=1013)
+        return
+    if scheme.lower() != "bearer" or not supplied_token or not hmac.compare_digest(supplied_token, DEVICE_TOKEN):
+        logger.warning("Rejected unauthenticated WebSocket connection")
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
-    client_host = websocket.client.host if websocket.client else "unknown"
     session_id = str(uuid.uuid4())
-    device_id = websocket.headers.get("device-id") or client_host
-    logger.info(f"[{session_id}] ESP32 connected from {client_host} (device {device_id})")
+    device_id = websocket.headers.get("device-id") or "authenticated-device"
+    logger.info("[%s] Authenticated device connected", session_id)
 
     audio_buffer: list[bytes] = []
     is_listening = False
     is_speaking = False
     is_processing = False
-    total_packets_received = 0
-    abort_requested = False
     conversation_id = _get_conversation(device_id)
     if conversation_id:
-        logger.info(f"[{session_id}] Resuming conversation for device {device_id}")
+        logger.info("[%s] Resuming device conversation", session_id)
     processing_queued = False
-    listen_mode = "unknown"
-    mic_during_reply = 0  # diagnostic: mic packets while thinking (STT/chat/TTS wait)
-    mic_during_speaking = 0  # diagnostic: mic packets while audio is playing (needed for voice barge-in)
-    barge_buffer: list[bytes] = []
-    barge_echo: list[float] = []  # mic RMS while the board plays (its own speaker echo), per reply
-    barge_hits = 0
     connected = True  # False once the socket is gone; every pipeline checks it and stops sending
 
     def mark_disconnected():
@@ -228,8 +275,8 @@ async def websocket_endpoint(websocket: WebSocket):
             return
         try:
             await websocket.send_text(json.dumps(msg))
-        except Exception as e:
-            logger.error(f"[{session_id}] Failed to send JSON: {e}")
+        except Exception:
+            logger.error("[%s] Failed to send status", session_id)
 
     def trigger_speech_processing():
         nonlocal is_listening, processing_queued
@@ -257,15 +304,9 @@ async def websocket_endpoint(websocket: WebSocket):
         return await asyncio.to_thread(audio_to_opus_packets, audio, SAMPLE_RATE, FRAME_DURATION_MS)
 
     async def handle_user_speech():
-        nonlocal audio_buffer, is_listening, is_speaking, is_processing, abort_requested, conversation_id
-        nonlocal last_check_packet_count, processing_queued, mic_during_reply, mic_during_speaking
+        nonlocal audio_buffer, is_listening, is_speaking, is_processing, conversation_id
+        nonlocal last_check_packet_count, processing_queued
         processing_queued = False
-        mic_during_reply = 0
-        mic_during_speaking = 0
-        barge_buffer.clear()
-        barge_echo.clear()
-        nonlocal barge_hits
-        barge_hits = 0
         if is_processing or not audio_buffer:
             return
 
@@ -281,13 +322,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
         # Need at least 8 packets (~480ms) to be meaningful audio
         if len(packets_to_process) < 8:
-            logger.info(f"[{session_id}] Audio buffer too small ({len(packets_to_process)} packets), ignoring")
+            logger.info("[%s] Audio buffer too short", session_id)
             is_processing = False
             is_listening = True
             return
 
-        duration_sec = len(packets_to_process) * FRAME_DURATION_MS / 1000
-        logger.info(f"[{session_id}] 🎙️ Processing {len(packets_to_process)} Opus packets ({duration_sec:.1f}s)")
+        logger.info("[%s] Processing audio", session_id)
         t0 = time.monotonic()
         prefetch: asyncio.Task | None = None
 
@@ -303,8 +343,8 @@ async def websocket_endpoint(websocket: WebSocket):
             await send_status(st.STATUS_THINKING, "thinking")
             try:
                 transcribed_text = (await langmind.transcribe(wav_bytes)).strip()
-            except Exception as e:
-                logger.error(f"[{session_id}] STT failed: {e}")
+            except Exception:
+                logger.error("[%s] STT request failed", session_id)
                 await fail(st.STATUS_ERROR_STT)
                 return
             finally:
@@ -315,8 +355,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info(f"[{session_id}] STT returned nothing")
                 await fail(st.STATUS_NO_SPEECH)
                 return
-            logger.info(f"[{session_id}] STT ok ({len(transcribed_text)} chars, {time.monotonic() - t0:.1f}s)"
-                        + (f": {transcribed_text!r}" if LOG_CONVERSATION else ""))
+            logger.info("[%s] STT completed in %.1fs", session_id, time.monotonic() - t0)
 
             t_stt = time.monotonic() - t0
 
@@ -324,8 +363,8 @@ async def websocket_endpoint(websocket: WebSocket):
             # (conversation_id keeps context across turns and reconnects)
             tts_tasks: asyncio.Queue = asyncio.Queue()  # ordered TTS tasks; None = end of answer
             tts_limit = asyncio.Semaphore(2)            # at most 2 TTS requests in flight
-            answer_parts: list[str] = []
-            chat_error: list[Exception] = []
+            received_answer = False
+            chat_error = False
             marks: dict[str, float] = {}
 
             async def tts_limited(text: str) -> list[bytes]:
@@ -333,7 +372,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     return await tts_chunk(text)
 
             async def producer():
-                nonlocal conversation_id
+                nonlocal conversation_id, received_answer, chat_error
                 chunker = st.StreamChunker()
                 try:
                     async for kind, value in langmind.chat_stream(VOICE_PREFIX + transcribed_text, conversation_id):
@@ -343,7 +382,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 _put_conversation(device_id, conversation_id)
                             continue
                         marks.setdefault("token", time.monotonic() - t0)
-                        answer_parts.append(value)
+                        received_answer = True
                         for chunk in chunker.feed(value):
                             marks.setdefault("chunk", time.monotonic() - t0)
                             tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk)))
@@ -352,8 +391,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     for chunk in chunker.flush():
                         marks.setdefault("chunk", time.monotonic() - t0)
                         tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk)))
-                except Exception as e:
-                    chat_error.append(e)
+                except Exception:
+                    chat_error = True
                 finally:
                     tts_tasks.put_nowait(None)
 
@@ -367,8 +406,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
                 try:
                     packets = await task
-                except Exception as e:
-                    logger.error(f"[{session_id}] TTS failed on chunk {spoken + 1}: {e}")
+                except Exception:
+                    logger.error("[%s] TTS request failed", session_id)
                     packets = []
                 spoken += 1
                 if stale():
@@ -391,8 +430,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         break
                     try:
                         await websocket.send_bytes(pkt)
-                    except Exception as e:
-                        logger.info(f"[{session_id}] Device gone during playback: {e}")
+                    except Exception:
+                        logger.info("[%s] Device disconnected during playback", session_id)
                         mark_disconnected()
                         break
                     await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
@@ -401,21 +440,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 t = tts_tasks.get_nowait()
                 if t is not None:
                     t.cancel()
-            answer_text = "".join(answer_parts)
-            if answer_text or chat_error:
-                logger.info(f"[{session_id}] Chat done ({len(answer_text)} chars, {spoken} chunks)"
-                            + (f": {answer_text!r}" if LOG_CONVERSATION else ""))
+            has_answer = received_answer
+            if has_answer or chat_error:
+                logger.info("[%s] Chat completed; audio chunks=%s", session_id, spoken)
             if chat_error:
-                logger.error(f"[{session_id}] Chat failed: {chat_error[0]}")
+                logger.error("[%s] Chat request failed", session_id)
             if stale():
                 logger.info(f"[{session_id}] Playback interrupted")
             elif not started:
-                await fail(st.STATUS_ERROR_LLM if (chat_error or not answer_text) else st.STATUS_ERROR_TTS)
+                await fail(st.STATUS_ERROR_LLM if (chat_error or not has_answer) else st.STATUS_ERROR_TTS)
             else:
                 await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
 
-        except Exception as e:
-            logger.error(f"[{session_id}] Error in handle_user_speech: {e}", exc_info=True)
+        except Exception:
+            logger.error("[%s] Speech pipeline failed", session_id)
             try:
                 await fail(st.STATUS_ERROR_LLM)
             except Exception:
@@ -423,8 +461,6 @@ async def websocket_endpoint(websocket: WebSocket):
         finally:
             if prefetch and not prefetch.done():
                 prefetch.cancel()
-            logger.info(f"[{session_id}] Mic packets while thinking: {mic_during_reply}, while speaking: {mic_during_speaking} "
-                        f"(listen mode={listen_mode})")
             if not stale():  # a newer turn owns the state after barge-in
                 is_speaking = False
                 is_processing = False
@@ -442,51 +478,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # Binary audio packet received from ESP32
             if "bytes" in msg and msg["bytes"]:
-                if is_speaking or is_processing:
-                    if is_speaking:
-                        mic_during_speaking += 1
-                    else:
-                        mic_during_reply += 1
-                    if is_speaking:
-                        # Voice barge-in. The board streams mic audio while it plays, so the mic also
-                        # hears its own speaker. Learn that echo level from the first windows of each
-                        # reply, then interrupt only when the mic is clearly louder than the echo and
-                        # VAD says it's speech, in 2 consecutive ~0.5 s windows.
-                        barge_buffer.append(msg["bytes"])
-                        if len(barge_buffer) >= 8:
-                            wav = await asyncio.to_thread(opus_packets_to_wav, list(barge_buffer), SAMPLE_RATE)
-                            barge_buffer.clear()
-                            a = check_voice_activity(wav) if wav else None
-                            if a:
-                                rms, ratio = a["rms"], a["overall_speech_ratio"]
-                                if len(barge_echo) < BARGE_LEARN_WINDOWS:
-                                    barge_echo.append(rms)
-                                    hit = False
-                                    need = None
-                                else:
-                                    echo = sorted(barge_echo)[len(barge_echo) // 2]
-                                    need = max(BARGE_RMS, echo * BARGE_FACTOR)
-                                    hit = ratio >= BARGE_SPEECH_RATIO and rms >= need
-                                barge_hits = barge_hits + 1 if hit else 0
-                                if BARGE_DEBUG:
-                                    logger.info(f"[{session_id}] barge check RMS={rms:.0f} Speech={ratio*100:.0f}% "
-                                                f"need={'learning' if need is None else f'{need:.0f}'} hits={barge_hits}")
-                                if barge_hits >= 2:
-                                    logger.info(f"[{session_id}] 🗣️ Voice barge-in (RMS={rms:.0f}, Speech={ratio*100:.0f}%)")
-                                    turn_id += 1
-                                    is_speaking = False
-                                    is_processing = False
-                                    audio_buffer.clear()
-                                    last_check_packet_count = 0
-                                    is_listening = True
-                                    # tts stop makes the board leave "speaking" and (auto mode) start listening.
-                                    await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
-                                    await send_status(st.STATUS_LISTENING, "neutral")
+                if not is_listening or is_speaking or is_processing:
                     continue
 
                 last_audio_packet_time = asyncio.get_event_loop().time()
                 pkt = msg["bytes"]
-                total_packets_received += 1
                 audio_buffer.append(pkt)
 
                 # 1. Max speech duration -> trigger response
@@ -503,7 +499,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     current_packets = list(audio_buffer)
                     wav_check = await asyncio.to_thread(opus_packets_to_wav, current_packets, SAMPLE_RATE)
                     if wav_check:
-                        analysis = check_voice_activity(wav_check)
+                        try:
+                            analysis = check_voice_activity(wav_check)
+                        finally:
+                            del wav_check
                         # Condition A: Speech was detected AND trailing silence detected (>600ms pause)
                         if analysis["has_speech"] and analysis["trailing_silent"]:
                             logger.info(
@@ -530,7 +529,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # Handshake hello
                     if msg_type == "hello":
-                        logger.info(f"[{session_id}] Received hello from device: {data}")
+                        logger.info("[%s] Device handshake completed", session_id)
                         await send_json({
                             "type": "hello",
                             "transport": "websocket",
@@ -546,20 +545,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Listen state change
                     elif msg_type == "listen":
                         state = data.get("state")
-                        if data.get("mode"):
-                            listen_mode = data["mode"]
-                        logger.info(f"[{session_id}] Device listen state: {state} (mode={listen_mode})")
                         if state in ["start", "detect"]:
                             audio_buffer.clear()
                             last_check_packet_count = 0
                             if is_processing or is_speaking:
-                                turn_id += 1  # barge-in: drop the old answer
+                                turn_id += 1  # a new button-initiated listen turn supersedes old output
                                 is_processing = False
                                 is_speaking = False
                             is_listening = True
                             await send_status(st.STATUS_LISTENING, "neutral")
                         elif state == "stop":
-                            logger.info(f"[{session_id}] Device stopped listening (button released). Processing...")
+                            logger.info("[%s] Button stopped listening", session_id)
                             trigger_speech_processing()
 
                     # User interrupt
@@ -581,8 +577,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         logger.info(f"[{session_id}] ESP32 disconnected")
-    except Exception as e:
-        logger.error(f"[{session_id}] WebSocket error: {e}")
+    except Exception:
+        logger.error("[%s] WebSocket session failed", session_id)
     finally:
         connected = False
         watchdog_running = False
@@ -591,17 +587,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 def main():
-    local_ip = get_local_ip()
-    ws_host = PUBLIC_URL if PUBLIC_URL else f"{local_ip}:{SERVER_PORT}"
-    print("\n" + "=" * 65, flush=True)
-    print("  XiaoZhi <--> LangMind Bridge Server is running!", flush=True)
-    print("=" * 65, flush=True)
-    print(f"  Local IP:         {local_ip}", flush=True)
-    print(f"  Server Port:      {SERVER_PORT}", flush=True)
-    print(f"  OTA URL for ESP32: http://{ws_host}/ota/", flush=True)
-    print(f"  WebSocket URL:    ws://{ws_host}/ws", flush=True)
-    print(f"  LangMind Agent:   {LANGMIND_AGENT_ID if LANGMIND_AGENT_ID != 'YOUR_LANGMIND_AGENT_ID' else '[NOT SET IN config.yaml]'}", flush=True)
-    print("=" * 65 + "\n", flush=True)
     uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
 
 
