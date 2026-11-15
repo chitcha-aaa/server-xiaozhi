@@ -11,7 +11,7 @@ server:
 langmind:
   base_url: "https://langmind.in.th/api"
   api_key: "lmpat_OEHYT_yl79bXI6Zw-ZWBeFQ7a-y-tTs_76hEvvnxzK4"   # ใส่ Personal API Key จาก LangMind
-  agent_id: "e2fe0242-6e05-4460-b846-1fab2f8df2e9"          # ใส่ Agent ID ที่ต้องการคุยด้วย
+  agent_id: "90303019-dffd-4890-be99-2e8475832901"          # ใส่ Agent ID ที่ต้องการคุยด้วย
   voice_speed: 1.0                            # ความเร็วเสียง (ค่าเริ่มต้น 1.0)
 
 audio:
