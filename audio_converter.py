@@ -8,6 +8,8 @@ import webrtcvad
 
 logger = logging.getLogger("AudioConverter")
 _vad = webrtcvad.Vad(2)
+# End-of-speech = this much trailing silence. 25 x 20 ms = 500 ms (was 700 ms).
+TRAILING_FRAMES = 25
 
 # Precomputed CRC table for Ogg
 _CRC_LOOKUP = [0] * 256
@@ -195,7 +197,7 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
             speech_frames += 1
 
     # Check trailing ~700ms (last 35 frames of 20ms)
-    trailing_frames = min(35, num_frames)
+    trailing_frames = min(TRAILING_FRAMES, num_frames)  # 20 ms frames
     trailing_pcm = pcm[-trailing_frames * 640 :]
     trailing_speech = sum(
         1 for i in range(0, trailing_frames * 640, 640) if _vad.is_speech(trailing_pcm[i : i + 640], 16000)
@@ -203,7 +205,9 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
     trailing_speech_ratio = trailing_speech / trailing_frames if trailing_frames > 0 else 0
     overall_speech_ratio = speech_frames / num_frames if num_frames > 0 else 0
 
-    has_speech = (overall_speech_ratio >= 0.18 and rms >= 300) or rms >= 600
+    # Loudness alone is not speech: a fan/room noise at RMS ~800 used to trigger empty STT calls
+    # every second. Require a real VAD speech share, and more of it when it's quiet.
+    has_speech = (overall_speech_ratio >= 0.30 and rms >= 300) or (overall_speech_ratio >= 0.15 and rms >= 1500)
     trailing_silent = trailing_speech_ratio < 0.20
 
     return {
