@@ -257,6 +257,7 @@ async def websocket_endpoint(websocket: WebSocket):
     turn_id = 0  # increments on every new listen/abort; stale pipelines check it and stop
     last_check_packet_count = 0
     last_audio_packet_time = asyncio.get_event_loop().time()
+    cooldown_until = 0.0
     watchdog_running = True
 
     async def vad_watchdog():
@@ -305,7 +306,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def handle_user_speech():
         nonlocal audio_buffer, is_listening, is_speaking, is_processing, conversation_id
-        nonlocal last_check_packet_count, processing_queued
+        nonlocal last_check_packet_count, processing_queued, cooldown_until
         processing_queued = False
         if is_processing or not audio_buffer:
             return
@@ -343,8 +344,9 @@ async def websocket_endpoint(websocket: WebSocket):
             await send_status(st.STATUS_THINKING, "thinking")
             try:
                 transcribed_text = (await langmind.transcribe(wav_bytes)).strip()
-            except Exception:
-                logger.error("[%s] STT request failed", session_id)
+            except Exception as e:
+                logger.error("[%s] STT request failed: %s", session_id, e)
+                cooldown_until = time.monotonic() + (5.0 if "429" in str(e) else 2.0)
                 await fail(st.STATUS_ERROR_STT)
                 return
             finally:
@@ -478,7 +480,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # Binary audio packet received from ESP32
             if "bytes" in msg and msg["bytes"]:
-                if not is_listening or is_speaking or is_processing:
+                if not is_listening or is_speaking or is_processing or time.monotonic() < cooldown_until:
                     continue
 
                 last_audio_packet_time = asyncio.get_event_loop().time()
@@ -492,9 +494,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     trigger_speech_processing()
                     continue
 
-                # 2. Check for speech and trailing silence once buffer reaches at least 25 packets (~1.5s)
-                # and check every 8 packets (~480ms)
-                if len(audio_buffer) >= 15 and (len(audio_buffer) - last_check_packet_count) >= 4:
+                # 2. Check for speech and trailing silence once buffer reaches at least 20 packets (~1.2s)
+                # and check every 6 packets (~360ms)
+                if len(audio_buffer) >= 20 and (len(audio_buffer) - last_check_packet_count) >= 6:
                     last_check_packet_count = len(audio_buffer)
                     current_packets = list(audio_buffer)
                     wav_check = await asyncio.to_thread(opus_packets_to_wav, current_packets, SAMPLE_RATE)
@@ -546,6 +548,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     elif msg_type == "listen":
                         state = data.get("state")
                         if state in ["start", "detect"]:
+                            cooldown_until = 0.0
                             audio_buffer.clear()
                             last_check_packet_count = 0
                             if is_processing or is_speaking:
