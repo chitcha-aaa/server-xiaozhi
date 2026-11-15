@@ -52,6 +52,16 @@ def _retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
     return delay
 
 
+def _format_error_detail(res: httpx.Response) -> str:
+    """Format rate-limit/proxy headers and truncated body for non-200 diagnostics."""
+    interesting = {
+        k: v for k, v in res.headers.items()
+        if k.lower() in ("retry-after", "server", "cf-ray") or "ratelimit" in k.lower()
+    }
+    body = res.text[:300].replace("\n", " ").strip()
+    return f"headers={interesting} body={body!r}"
+
+
 class LangMindError(RuntimeError):
     pass
 
@@ -100,6 +110,8 @@ class LangMindClient:
             else:
                 if res.status_code == 200:
                     return res
+                if attempt == 0 or res.status_code != 429:
+                    logger.warning(f"LangMind {name} HTTP {res.status_code} {_format_error_detail(res)}")
                 if res.status_code < 500 and res.status_code != 429:
                     raise LangMindError(f"{name} HTTP {res.status_code}")
                 last = f"HTTP {res.status_code}"
