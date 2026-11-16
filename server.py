@@ -534,6 +534,13 @@ async def websocket_endpoint(websocket: WebSocket):
                             analysis = check_voice_activity(wav_check)
                         finally:
                             del wav_check
+                        logger.info(
+                            f"[{session_id}] VAD pkts={len(audio_buffer)} rms={analysis['rms']:.0f} "
+                            f"speech={analysis.get('overall_speech_ratio', 0)*100:.0f}% "
+                            f"trail={analysis.get('trailing_speech_ratio', 0)*100:.0f}% "
+                            f"loud={analysis.get('loud_speech_frames', 0)} thr={analysis.get('loud_enough', 0):.0f} "
+                            f"has_speech={analysis['has_speech']} trailing_silent={analysis['trailing_silent']}"
+                        )
                         # Condition A: Speech was detected AND trailing silence detected (>600ms pause)
                         if analysis["has_speech"] and analysis["trailing_silent"]:
                             logger.info(

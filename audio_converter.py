@@ -272,4 +272,5 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
         "trailing_silent": trailing_silent,
         "frames": num_frames,
         "loud_speech_frames": loud_speech_frames,
+        "loud_enough": loud_enough,
     }
