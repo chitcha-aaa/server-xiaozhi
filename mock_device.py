@@ -58,6 +58,7 @@ async def run(url: str, audio: bytes, turns: int, barge: str | None = None) -> i
         "Device-Id": "02:00:00:00:00:01",
         "Client-Id": "mock-device",
         "Protocol-Version": "1",
+        **({"Authorization": f"Bearer {os.environ['DEVICE_TOKEN']}"} if os.environ.get("DEVICE_TOKEN") else {}),
     }) as ws:
         await ws.send(json.dumps({
             "type": "hello", "version": 1, "transport": "websocket",

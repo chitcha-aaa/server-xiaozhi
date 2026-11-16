@@ -7,7 +7,8 @@ import webrtcvad
 logger = logging.getLogger("AudioConverter")
 _vad = webrtcvad.Vad(2)
 # End-of-speech = this much trailing silence. 25 x 20 ms = 500 ms (was 700 ms).
-TRAILING_FRAMES = 25
+TRAILING_FRAMES = 40  # 800 ms pause ends the turn (500 ms cut Thai speakers mid-sentence)
+MIN_LOUD_SPEECH_FRAMES = 30  # need >= 0.6 s of loud voiced frames before a pause may end the turn
 TRAILING_MIN_RMS = 150.0   # a trailing frame quieter than this is silence
 TRAILING_REL_LEVEL = 0.15  # ...or quieter than 15% of the loud (90th percentile) speech-frame RMS
 
@@ -258,7 +259,10 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
     # Loudness alone is not speech: a fan/room noise at RMS ~800 used to trigger empty STT calls
     # every second. Require a real VAD speech share, and more of it when it's quiet.
     has_speech = (overall_speech_ratio >= 0.30 and rms >= 300) or (overall_speech_ratio >= 0.15 and rms >= 1500)
-    trailing_silent = trailing_speech_ratio < 0.20
+    # Don't end the turn on a pause until the user has really spoken (~0.6 s of loud speech).
+    # Early pauses (breath, "เอ่อ") used to end turns 1-2 s after Listening -> "Didn't catch that".
+    loud_speech_frames = sum(1 for v, r in zip(frame_vad, frame_rms) if v and r >= loud_enough)
+    trailing_silent = trailing_speech_ratio < 0.20 and loud_speech_frames >= MIN_LOUD_SPEECH_FRAMES
 
     return {
         "rms": rms,
@@ -267,4 +271,5 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
         "has_speech": has_speech,
         "trailing_silent": trailing_silent,
         "frames": num_frames,
+        "loud_speech_frames": loud_speech_frames,
     }
