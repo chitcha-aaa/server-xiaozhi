@@ -82,6 +82,7 @@ FRAME_DURATION_MS = int(config.get("audio", {}).get("frame_duration_ms", 60))
 # 60 ms SILK frames, so TTS is encoded the same way it sends.
 TTS_ENCODE_FRAME_MS = int(config.get("audio", {}).get("tts_encode_frame_ms", 20))
 TTS_BITRATE = str(config.get("audio", {}).get("tts_bitrate", "16k"))
+KEEP_ON_CLEAR_PACKETS = max(1, 1000 // FRAME_DURATION_MS)  # ~1 s kept when a silent window is dropped
 
 # Keep a device's LangMind conversation across Wi-Fi/WebSocket reconnects for this long (seconds).
 # A board reboot that stays offline longer than this starts a fresh conversation.
@@ -545,8 +546,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         # Condition B: Pure silence / no speech at all after 55 packets (~3.3 seconds)
                         elif len(audio_buffer) >= 55 and not analysis["has_speech"]:
                             logger.info(f"[{session_id}] 💤 No voice detected in 3.3s (RMS={analysis['rms']:.1f}). Clearing buffer.")
-                            audio_buffer.clear()
-                            last_check_packet_count = 0
+                            # Keep the last ~1 s: speech that starts just before this check would
+                            # otherwise lose its first words (STT then returns nothing).
+                            del audio_buffer[:-KEEP_ON_CLEAR_PACKETS]
+                            last_check_packet_count = len(audio_buffer)
                             await send_status(st.STATUS_READY, "neutral")
                             await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
                             continue

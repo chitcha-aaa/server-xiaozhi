@@ -8,6 +8,8 @@ logger = logging.getLogger("AudioConverter")
 _vad = webrtcvad.Vad(2)
 # End-of-speech = this much trailing silence. 25 x 20 ms = 500 ms (was 700 ms).
 TRAILING_FRAMES = 25
+TRAILING_MIN_RMS = 150.0   # a trailing frame quieter than this is silence
+TRAILING_REL_LEVEL = 0.15  # ...or quieter than 15% of the loud (90th percentile) speech-frame RMS
 
 # Precomputed CRC table for Ogg
 _CRC_LOOKUP = [0] * 256
@@ -230,17 +232,26 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
     rms = math.sqrt(sum(s * s for s in samples) / num_samples)
 
     num_frames = len(pcm) // 640
-    speech_frames = 0
+    frame_vad = []
+    frame_rms = []
     for i in range(0, num_frames * 640, 640):
-        if _vad.is_speech(pcm[i : i + 640], 16000):
-            speech_frames += 1
+        frame = pcm[i : i + 640]
+        frame_vad.append(_vad.is_speech(frame, 16000))
+        fs = struct.unpack("<320h", frame)
+        frame_rms.append(math.sqrt(sum(x * x for x in fs) / 320))
+    speech_frames = sum(frame_vad)
 
-    # Check trailing ~700ms (last 35 frames of 20ms)
-    trailing_frames = min(TRAILING_FRAMES, num_frames)  # 20 ms frames
-    trailing_pcm = pcm[-trailing_frames * 640 :]
+    # Trailing silence (last TRAILING_FRAMES x 20 ms). VAD alone keeps calling faint sound
+    # (room talk, echo) speech, so the end of an utterance was missed and every turn waited
+    # for the 10 s cap. A trailing frame only counts as speech when it is also loud compared
+    # with this utterance's own speech level.
+    voiced = sorted(r for r, v in zip(frame_rms, frame_vad) if v)
+    speech_level = voiced[(len(voiced) * 9) // 10] if voiced else 0.0  # 90th percentile: the loud part of the speech
+    loud_enough = max(TRAILING_MIN_RMS, TRAILING_REL_LEVEL * speech_level)
+    trailing_frames = min(TRAILING_FRAMES, num_frames)
     trailing_speech = sum(
-        1 for i in range(0, trailing_frames * 640, 640) if _vad.is_speech(trailing_pcm[i : i + 640], 16000)
-    )
+        1 for v, r in zip(frame_vad[-trailing_frames:], frame_rms[-trailing_frames:]) if v and r >= loud_enough
+    ) if trailing_frames else 0
     trailing_speech_ratio = trailing_speech / trailing_frames if trailing_frames > 0 else 0
     overall_speech_ratio = speech_frames / num_frames if num_frames > 0 else 0
 
