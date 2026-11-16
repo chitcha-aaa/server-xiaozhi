@@ -253,6 +253,7 @@ async def websocket_endpoint(websocket: WebSocket):
     if conversation_id:
         logger.info("[%s] Resuming device conversation", session_id)
     processing_queued = False
+    speech_confirmed = False  # set when the trailing-silence VAD already found speech in this buffer
     connected = True  # False once the socket is gone; every pipeline checks it and stops sending
 
     def mark_disconnected():
@@ -292,10 +293,11 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception:
             logger.error("[%s] Failed to send status", session_id)
 
-    def trigger_speech_processing():
-        nonlocal is_listening, processing_queued
+    def trigger_speech_processing(confirmed: bool = False):
+        nonlocal is_listening, processing_queued, speech_confirmed
         if is_processing or processing_queued or not audio_buffer:
             return
+        speech_confirmed = confirmed
         is_listening = False
         processing_queued = True  # block duplicate triggers until the task starts
         asyncio.create_task(handle_user_speech())
@@ -320,8 +322,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def handle_user_speech():
         nonlocal audio_buffer, is_listening, is_speaking, is_processing, conversation_id
-        nonlocal last_check_packet_count, processing_queued, cooldown_until
+        nonlocal last_check_packet_count, processing_queued, cooldown_until, speech_confirmed
         processing_queued = False
+        already_has_speech, speech_confirmed = speech_confirmed, False
         if is_processing or not audio_buffer:
             return
 
@@ -355,7 +358,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 return
 
             analysis = check_voice_activity(wav_bytes)
-            if not analysis["has_speech"]:
+            # The whole buffer includes the silence before and after speaking, so its speech ratio
+            # is lower than the window the trailing-silence check saw. A quiet mic (RMS 400-900 on
+            # the zuowei board) then fails here although speech was found, so trust that check.
+            if not already_has_speech and not analysis["has_speech"]:
                 del wav_bytes
                 logger.info(f"[{session_id}] 💤 No speech in buffered audio (RMS={analysis['rms']:.1f}); skipping STT")
                 await send_status(st.STATUS_READY, "neutral")
@@ -533,7 +539,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 f"[{session_id}] 🤫 User finished speaking (RMS={analysis['rms']:.1f}, "
                                 f"Speech={analysis['overall_speech_ratio']*100:.1f}%, TrailingSilence=True). Processing..."
                             )
-                            trigger_speech_processing()
+                            trigger_speech_processing(confirmed=True)
                             continue
 
                         # Condition B: Pure silence / no speech at all after 55 packets (~3.3 seconds)
