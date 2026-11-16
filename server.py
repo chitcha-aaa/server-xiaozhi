@@ -78,6 +78,10 @@ VOICE_SPEED = float(os.environ.get("VOICE_SPEED") or config.get("langmind", {}).
 
 SAMPLE_RATE = int(config.get("audio", {}).get("sample_rate", 16000))
 FRAME_DURATION_MS = int(config.get("audio", {}).get("frame_duration_ms", 60))
+# The 1.4.7 board sends 3 x 20 ms SILK frames per 60 ms packet and crashes decoding single
+# 60 ms SILK frames, so TTS is encoded the same way it sends.
+TTS_ENCODE_FRAME_MS = int(config.get("audio", {}).get("tts_encode_frame_ms", 20))
+TTS_BITRATE = str(config.get("audio", {}).get("tts_bitrate", "16k"))
 
 # Keep a device's LangMind conversation across Wi-Fi/WebSocket reconnects for this long (seconds).
 # A board reboot that stays offline longer than this starts a fresh conversation.
@@ -311,7 +315,8 @@ async def websocket_endpoint(websocket: WebSocket):
         audio = await langmind.speech(text)
         if not audio:
             return []
-        return await asyncio.to_thread(audio_to_opus_packets, audio, SAMPLE_RATE, FRAME_DURATION_MS)
+        return await asyncio.to_thread(audio_to_opus_packets, audio, SAMPLE_RATE, FRAME_DURATION_MS,
+                                       TTS_ENCODE_FRAME_MS, TTS_BITRATE)
 
     async def handle_user_speech():
         nonlocal audio_buffer, is_listening, is_speaking, is_processing, conversation_id

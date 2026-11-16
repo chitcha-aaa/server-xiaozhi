@@ -119,10 +119,15 @@ def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes
     return b""
 
 
-def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_duration_ms: int = 60) -> list[bytes]:
-    """Takes MP3 or WAV bytes (from LangMind TTS) and converts them to a list of raw Opus packets (60ms each)."""
+def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_duration_ms: int = 60,
+                          encode_frame_ms: int = 0, bitrate: str = "24k") -> list[bytes]:
+    """Takes MP3 or WAV bytes (from LangMind TTS) and converts them to a list of raw Opus packets.
+    Each packet covers frame_duration_ms. With encode_frame_ms set (e.g. 20 for 60 ms packets),
+    frames are encoded at that size and several are joined per packet."""
     if not audio_bytes:
         return []
+    enc_ms = encode_frame_ms or frame_duration_ms
+    pack_frames = frame_duration_ms // enc_ms
 
     try:
         res = subprocess.run(
@@ -131,8 +136,9 @@ def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_du
                 "-c:a", "libopus",
                 "-ar", str(sample_rate),
                 "-ac", "1",
-                "-b:a", "24k",
-                "-frame_duration", str(frame_duration_ms),
+                "-b:a", bitrate,
+                "-application", "voip",
+                "-frame_duration", str(enc_ms),
                 "-f", "ogg",
                 "pipe:1",
             ],
@@ -173,7 +179,37 @@ def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_du
         pos = body_pos
 
     # Packets[0] is OpusHead, Packets[1] is OpusTags, Packets[2:] are the audio packets
-    return packets[2:]
+    packets = packets[2:]
+    if pack_frames > 1:
+        packets = _pack_code3(packets, pack_frames)
+    return packets
+
+
+def _opus_len_bytes(n: int) -> bytes:
+    if n < 252:
+        return bytes([n])
+    b0 = 252 + ((n - 252) & 3)
+    return bytes([b0, (n - b0) >> 2])
+
+
+def _pack_code3(frames: list[bytes], per_packet: int) -> list[bytes]:
+    """Join single-frame Opus packets (TOC code 0) into code-3 packets holding `per_packet`
+    frames each (RFC 6716 3.2.5), the layout the 1.4.7 board itself sends: 3 x 20 ms SILK."""
+    out = []
+    for i in range(0, len(frames), per_packet):
+        group = frames[i:i + per_packet]
+        toc = group[0][0]
+        assert all(f[0] == toc for f in group), "frames in one packet must share a TOC"
+        bodies = [f[1:] for f in group]
+        vbr = len({len(b) for b in bodies}) > 1
+        pkt = bytearray([(toc & 0xFC) | 3, (0x80 if vbr else 0) | len(group)])
+        if vbr:
+            for b in bodies[:-1]:
+                pkt += _opus_len_bytes(len(b))
+        for b in bodies:
+            pkt += b
+        out.append(bytes(pkt))
+    return out
 
 
 def check_voice_activity(wav_bytes: bytes) -> dict:
