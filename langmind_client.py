@@ -114,6 +114,8 @@ class LangMindClient:
                     logger.warning(f"LangMind {name} HTTP {res.status_code} {_format_error_detail(res)}")
                 if res.status_code < 500 and res.status_code != 429:
                     raise LangMindError(f"{name} HTTP {res.status_code}")
+                if res.status_code == 429 and "QUOTA_EXCEEDED" in res.text:
+                    raise LangMindError(f"{name} HTTP 429 (quota exceeded)")
                 last = f"HTTP {res.status_code}"
                 retry_after = res.headers.get("Retry-After")
             if attempt < len(RETRY_DELAYS):

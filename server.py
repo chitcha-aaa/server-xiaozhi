@@ -94,6 +94,7 @@ MAX_SPEECH_PACKETS = int(MAX_SPEECH_SEC * 1000 / int(config.get("audio", {}).get
 
 _conversations: dict[str, tuple[str, float]] = {}  # device_id -> (conversation_id, last_used)
 _MAX_CONVERSATIONS = 200
+_active_sessions: dict[str, tuple[str, object]] = {}  # device_id -> (session_id, stop_fn)
 
 
 def _runtime_ready() -> bool:
@@ -251,8 +252,16 @@ async def websocket_endpoint(websocket: WebSocket):
     connected = True  # False once the socket is gone; every pipeline checks it and stops sending
 
     def mark_disconnected():
-        nonlocal connected
+        nonlocal connected, is_listening, watchdog_running
         connected = False
+        is_listening = False
+        watchdog_running = False
+        audio_buffer.clear()
+
+    prev = _active_sessions.get(device_id)
+    if prev and prev[0] != session_id:
+        prev[1]()
+    _active_sessions[device_id] = (session_id, mark_disconnected)
 
     turn_id = 0  # increments on every new listen/abort; stale pipelines check it and stop
     last_check_packet_count = 0
@@ -338,6 +347,14 @@ async def websocket_endpoint(websocket: WebSocket):
             if not wav_bytes:
                 logger.warning(f"[{session_id}] Could not convert audio to WAV")
                 await fail(st.STATUS_NO_SPEECH)
+                return
+
+            analysis = check_voice_activity(wav_bytes)
+            if not analysis["has_speech"]:
+                del wav_bytes
+                logger.info(f"[{session_id}] 💤 No speech in buffered audio (RMS={analysis['rms']:.1f}); skipping STT")
+                await send_status(st.STATUS_READY, "neutral")
+                await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
                 return
 
             # 1. STT
@@ -583,8 +600,9 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         logger.error("[%s] WebSocket session failed", session_id)
     finally:
-        connected = False
-        watchdog_running = False
+        mark_disconnected()
+        if _active_sessions.get(device_id, (None,))[0] == session_id:
+            _active_sessions.pop(device_id, None)
         watchdog_task.cancel()
         logger.info(f"[{session_id}] Session closed")
 

@@ -55,6 +55,29 @@ def make_ogg_page(header_type: int, granule_pos: int, serial: int, seq: int, pac
     return bytes(header) + body
 
 
+def _pcm16_to_wav(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+    """Wrap raw 16-bit mono PCM bytes in a canonical 44-byte WAV header with exact sizes."""
+    data_size = len(pcm_data)
+    byte_rate = sample_rate * 2  # mono 16-bit
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,           # PCM fmt chunk size
+        1,            # AudioFormat = 1 (PCM)
+        1,            # NumChannels = 1 (mono)
+        sample_rate,
+        byte_rate,
+        2,            # BlockAlign = 2 bytes
+        16,           # BitsPerSample = 16
+        b"data",
+        data_size,
+    )
+    return header + pcm_data
+
+
 def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes:
     """Takes a list of raw Opus audio packets (from XiaoZhi ESP32) and converts them to WAV bytes."""
     if not packets:
@@ -82,7 +105,7 @@ def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes
     try:
         res = subprocess.run(
             ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "ogg", "-i", "pipe:0",
-             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "pipe:1"],
+             "-ar", str(sample_rate), "-ac", "1", "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"],
             input=ogg_data,
             capture_output=True,
             timeout=30,
@@ -91,7 +114,7 @@ def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes
         logger.error("FFmpeg Opus-to-WAV conversion failed (%s)", type(exc).__name__)
         return b""
     if res.returncode == 0 and res.stdout:
-        return res.stdout
+        return _pcm16_to_wav(res.stdout, sample_rate)
     logger.error("FFmpeg Opus-to-WAV conversion failed")
     return b""
 
