@@ -1,8 +1,6 @@
-import os
 import math
 import struct
 import subprocess
-import tempfile
 import logging
 import webrtcvad
 
@@ -55,8 +53,35 @@ def make_ogg_page(header_type: int, granule_pos: int, serial: int, seq: int, pac
     return bytes(header) + body
 
 
+def pcm_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
+    """Wraps raw 16-bit signed little-endian PCM bytes in a standard 44-byte WAV header in memory."""
+    byte_rate = sample_rate * channels * 2
+    block_align = channels * 2
+    data_size = len(pcm)
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM format
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        16,  # bits per sample
+        b"data",
+        data_size,
+    )
+    return header + pcm
+
+
 def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes:
-    """Takes a list of raw Opus audio packets (from XiaoZhi ESP32) and converts them to WAV bytes."""
+    """
+    Takes a list of raw Opus audio packets (from XiaoZhi ESP32) and converts them
+    to WAV bytes completely in memory via FFmpeg stdin/stdout pipes (no disk I/O).
+    """
     if not packets:
         return b""
 
@@ -79,64 +104,65 @@ def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes
 
     ogg_data = b"".join(pages)
 
-    with tempfile.NamedTemporaryFile(suffix=".opus", delete=False) as f_in:
-        in_path = f_in.name
-        f_in.write(ogg_data)
-
-    out_path = in_path + ".wav"
-    try:
-        res = subprocess.run(
-            ["ffmpeg", "-y", "-i", in_path, "-ar", str(sample_rate), "-ac", "1", out_path],
-            capture_output=True,
-        )
-        if res.returncode == 0 and os.path.exists(out_path):
-            with open(out_path, "rb") as f_out:
-                return f_out.read()
-        logger.error(f"FFmpeg failed converting Opus to WAV: {res.stderr.decode('utf-8', errors='ignore')}")
-        return b""
-    finally:
-        if os.path.exists(in_path):
-            try:
-                os.remove(in_path)
-            except OSError:
-                pass
-        if os.path.exists(out_path):
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
-
-
-def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_duration_ms: int = 60) -> list[bytes]:
-    """Takes MP3 or WAV bytes (from LangMind TTS) and converts them to a list of raw Opus packets (60ms each)."""
-    if not audio_bytes:
-        return []
-
-    with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as f_in:
-        in_path = f_in.name
-        f_in.write(audio_bytes)
-
-    out_path = in_path + ".opus"
     try:
         res = subprocess.run(
             [
-                "ffmpeg", "-y", "-i", in_path,
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-f", "ogg",
+                "-i", "pipe:0",
+                "-f", "s16le",
+                "-ar", str(sample_rate),
+                "-ac", "1",
+                "pipe:1",
+            ],
+            input=ogg_data,
+            capture_output=True,
+        )
+        if res.returncode == 0 and res.stdout:
+            return pcm_to_wav(res.stdout, sample_rate=sample_rate, channels=1)
+        logger.error(f"FFmpeg failed converting Opus to PCM: {res.stderr.decode('utf-8', errors='ignore')}")
+        return b""
+    except Exception as e:
+        logger.error(f"Exception in opus_packets_to_wav: {e}")
+        return b""
+
+
+def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_duration_ms: int = 60) -> list[bytes]:
+    """
+    Takes WAV or MP3 bytes (from LangMind TTS) and converts them to a list of raw Opus packets
+    completely in memory via FFmpeg stdin/stdout pipes (no disk I/O).
+    """
+    if not audio_bytes:
+        return []
+
+    try:
+        res = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", "pipe:0",
                 "-c:a", "libopus",
                 "-ar", str(sample_rate),
                 "-ac", "1",
                 "-b:a", "24k",
+                "-vbr", "on",
+                "-compression_level", "5",
+                "-application", "voip",
                 "-frame_duration", str(frame_duration_ms),
                 "-f", "ogg",
-                out_path,
+                "pipe:1",
             ],
+            input=audio_bytes,
             capture_output=True,
         )
-        if res.returncode != 0 or not os.path.exists(out_path):
+        if res.returncode != 0 or not res.stdout:
             logger.error(f"FFmpeg failed converting audio to Opus: {res.stderr.decode('utf-8', errors='ignore')}")
             return []
 
-        with open(out_path, "rb") as f_out:
-            data = f_out.read()
+        data = res.stdout
 
         # Parse Ogg Opus packets
         pos = 0
@@ -158,25 +184,17 @@ def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_du
 
         # Packets[0] is OpusHead, Packets[1] is OpusTags, Packets[2:] are the audio packets
         return packets[2:]
-    finally:
-        if os.path.exists(in_path):
-            try:
-                os.remove(in_path)
-            except OSError:
-                pass
-        if os.path.exists(out_path):
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
+    except Exception as e:
+        logger.error(f"Exception in audio_to_opus_packets: {e}")
+        return []
 
 
-def check_voice_activity(wav_bytes: bytes) -> dict:
+def check_voice_activity(wav_bytes: bytes, trailing_window_frames: int = 22) -> dict:
     """
     Analyzes 16kHz mono WAV bytes for:
     1. Overall RMS energy (volume)
     2. WebRTC VAD speech ratio
-    3. Trailing silence (has the speaker paused at the end)
+    3. Trailing silence (default 22 frames of 20ms = 440ms pause at the end)
     """
     if len(wav_bytes) <= 44 + 640:
         return {"has_speech": False, "trailing_silent": True, "rms": 0.0}
@@ -194,8 +212,8 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
         if _vad.is_speech(pcm[i : i + 640], 16000):
             speech_frames += 1
 
-    # Check trailing ~700ms (last 35 frames of 20ms)
-    trailing_frames = min(35, num_frames)
+    # Check trailing ~440ms (last 22 frames of 20ms) for faster end-of-turn response
+    trailing_frames = min(trailing_window_frames, num_frames)
     trailing_pcm = pcm[-trailing_frames * 640 :]
     trailing_speech = sum(
         1 for i in range(0, trailing_frames * 640, 640) if _vad.is_speech(trailing_pcm[i : i + 640], 16000)
@@ -203,8 +221,8 @@ def check_voice_activity(wav_bytes: bytes) -> dict:
     trailing_speech_ratio = trailing_speech / trailing_frames if trailing_frames > 0 else 0
     overall_speech_ratio = speech_frames / num_frames if num_frames > 0 else 0
 
-    has_speech = (overall_speech_ratio >= 0.18 and rms >= 300) or rms >= 600
-    trailing_silent = trailing_speech_ratio < 0.20
+    has_speech = (overall_speech_ratio >= 0.16 and rms >= 280) or rms >= 550
+    trailing_silent = trailing_speech_ratio < 0.18
 
     return {
         "rms": rms,
