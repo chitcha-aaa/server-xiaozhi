@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import hmac
 import json
 import logging
@@ -12,12 +13,15 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import uvicorn
 
-from audio_converter import opus_packets_to_wav, audio_to_opus_packets, check_voice_activity
+import audio_converter
+from audio_converter import (opus_packets_to_wav, audio_to_opus_packets, check_voice_activity,
+                            VadTracker)
 from langmind_client import LangMindClient
 import speech_text as st
+import screen_image
 
 # Windows Thai console (cp874) can't print emoji/Thai mixed output; force UTF-8.
 for _stream in (sys.stdout, sys.stderr):
@@ -27,10 +31,18 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # Configure Logging
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+# LOG_FILE keeps a copy on disk. Python writes it itself: piping the server through
+# Tee-Object fails on PowerShell 5.1, which wraps a native program's stderr in a
+# NativeCommandError and stops the script.
+_log_file = os.environ.get("LOG_FILE", "").strip()
+if _log_file:
+    _log_handlers.append(logging.FileHandler(_log_file, mode="a", encoding="utf-8"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
     datefmt="%H:%M:%S",
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("XiaoZhiServer")
 
@@ -74,6 +86,59 @@ LANGMIND_BASE_URL = os.environ.get("LANGMIND_BASE_URL", config.get("langmind", {
 LANGMIND_API_KEY = os.environ.get("LANGMIND_API_KEY", "").strip()
 LANGMIND_AGENT_ID = (os.environ.get("LANGMIND_AGENT_ID") or config.get("langmind", {}).get("agent_id", "")).strip()
 DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "").strip()
+# Clock handed to the board in the /ota/ reply. Defaults to Thailand, since a
+# server in another region would otherwise set the board's clock to its own time.
+TIMEZONE_NAME = (os.environ.get("TIMEZONE") or config.get("server", {}).get("timezone", "Asia/Bangkok")).strip()
+TIMEZONE_OFFSET_MIN = float(os.environ.get("TIMEZONE_OFFSET_MIN")
+                            or config.get("server", {}).get("timezone_offset_min", 420))
+# Log what was heard and what was answered, for watching a conversation go by.
+# Off by default: it writes what the user said into the log. The screen is a
+# separate matter and never shows this text (see send_status).
+LOG_TRANSCRIPT = (os.environ.get("LOG_TRANSCRIPT", "").strip().lower()
+                  or str(config.get("server", {}).get("log_transcript", "")).strip().lower()) in ("1", "true", "yes", "on")
+# Extra per-device tokens, so a second board can be revoked on its own without
+# changing the first board's token. Format: "name:token,name:token" (env
+# DEVICE_TOKENS), or a devices: {name: token} mapping in config.yaml.
+def _load_device_tokens() -> dict[str, str]:
+    tokens: dict[str, str] = {}
+    if DEVICE_TOKEN:
+        tokens["board1"] = DEVICE_TOKEN
+    raw = os.environ.get("DEVICE_TOKENS", "").strip()
+    for item in raw.split(","):
+        name, _, value = item.partition(":")
+        name, value = name.strip(), value.strip()
+        if name and len(value) >= 32:
+            tokens[name] = value
+    for name, value in (config.get("devices") or {}).items():
+        value = str(value).strip()
+        if len(value) >= 32:
+            tokens[str(name)] = value
+    return tokens
+
+
+DEVICE_TOKENS = _load_device_tokens()
+# device-id (MAC) -> token, for handing each board its own token over OTA.
+def _load_ota_device_tokens() -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for mac, name in (config.get("device_ids") or {}).items():
+        pairs[str(mac).strip().lower()] = str(name)
+    for item in os.environ.get("DEVICE_IDS", "").split(","):
+        mac, _, name = item.rpartition(":")
+        if mac.strip() and name.strip():
+            pairs[mac.strip().lower()] = name.strip()
+    return {mac: DEVICE_TOKENS[name] for mac, name in pairs.items() if name in DEVICE_TOKENS}
+
+
+OTA_DEVICE_TOKENS = _load_ota_device_tokens()
+
+
+def _match_device_token(supplied: str) -> str | None:
+    """Returns the device name for a valid token, or None. Compared in constant time."""
+    matched = None
+    for name, value in DEVICE_TOKENS.items():
+        if hmac.compare_digest(supplied, value):
+            matched = name
+    return matched
 VOICE_SPEED = float(os.environ.get("VOICE_SPEED") or config.get("langmind", {}).get("voice_speed", 1.0))
 
 SAMPLE_RATE = int(config.get("audio", {}).get("sample_rate", 16000))
@@ -83,6 +148,37 @@ FRAME_DURATION_MS = int(config.get("audio", {}).get("frame_duration_ms", 60))
 TTS_ENCODE_FRAME_MS = int(config.get("audio", {}).get("tts_encode_frame_ms", 20))
 TTS_BITRATE = str(config.get("audio", {}).get("tts_bitrate", "16k"))
 KEEP_ON_CLEAR_PACKETS = max(1, 1000 // FRAME_DURATION_MS)  # ~1 s kept when a silent window is dropped
+
+# End-of-speech timings. Defaults are tuned for board 2 (lynai); board 1 (zuowei, quiet mic)
+# may need trailing_silence_ms 800 / min_loud_speech_ms 600 back in config.yaml.
+audio_converter.configure(
+    trailing_silence_ms=int(config.get("audio", {}).get("trailing_silence_ms", 500)),
+    min_loud_speech_ms=int(config.get("audio", {}).get("min_loud_speech_ms", 400)),
+    trailing_rel_level=float(config.get("audio", {}).get("trailing_rel_level", 0.35)),
+    trailing_min_rms=float(config.get("audio", {}).get("trailing_min_rms", 150)),
+    aggressiveness=int(config.get("audio", {}).get("vad_aggressiveness", 3)),
+)
+# How often the end-of-speech check runs: every N packets once the buffer has M.
+# Was 6/20 (360 ms steps, no check before 1.2 s) which alone added up to ~0.5 s before answering.
+VAD_CHECK_EVERY = max(1, int(config.get("audio", {}).get("vad_check_every_packets", 3)))
+VAD_CHECK_FROM = max(2, int(config.get("audio", {}).get("vad_check_min_packets", 10)))
+
+# On-screen status wording. Allowlisted strings only (hard rule: never transcript or answer
+# text). Non-ASCII wording depends on the device font - check it on the real screen.
+st.configure(config.get("status_text", {}) or {})
+# Which channel carries the status text to the screen: "stt" (user line), "tts"
+# (assistant line, what board 2's vendor server used) or "both".
+STATUS_CHANNEL = str(config.get("server", {}).get("status_channel", "both")).strip().lower()
+# Draw the status as a picture and push it with the device's screen.preview_image MCP tool,
+# for firmware whose UI ignores chat text (board 2's vendor build does).
+SCREEN_IMAGE = str(config.get("server", {}).get("screen_image", "")).strip().lower() in ("1", "true", "yes", "on")
+SCREEN_IMAGE_BASE = str(config.get("server", {}).get("screen_image_base_url", "")).strip().rstrip("/")
+# Talk MCP to the device at all (needed for the screen tools and for seeing its tool list).
+MCP_ENABLE = str(config.get("server", {}).get("mcp", "true")).strip().lower() in ("1", "true", "yes", "on")
+# Where screen snapshots are written when /debug/snapshot is called.
+SNAPSHOT_DIR = str(config.get("server", {}).get("snapshot_dir", "")).strip() or "."
+if STATUS_CHANNEL not in ("stt", "tts", "both"):
+    STATUS_CHANNEL = "both"
 
 # Keep a device's LangMind conversation across Wi-Fi/WebSocket reconnects for this long (seconds).
 # A board reboot that stays offline longer than this starts a fresh conversation.
@@ -103,7 +199,7 @@ _active_sessions: dict[str, tuple[str, object]] = {}  # device_id -> (session_id
 
 
 def _runtime_ready() -> bool:
-    if not (LANGMIND_API_KEY and LANGMIND_AGENT_ID) or len(DEVICE_TOKEN) < 32:
+    if not (LANGMIND_API_KEY and LANGMIND_AGENT_ID) or not DEVICE_TOKENS:
         return False
     if IS_PRODUCTION:
         parsed = _parse_websocket_url(PUBLIC_URL)
@@ -155,6 +251,30 @@ def _websocket_url(request: Request) -> str:
     return f"ws://{host}/ws"
 
 
+_snapshot_takers: dict = {}
+
+_STATUS_SLOTS = {
+    "listening": lambda: st.STATUS_LISTENING,
+    "thinking": lambda: st.STATUS_THINKING,
+    "speaking": lambda: st.STATUS_SPEAKING,
+    "no_speech": lambda: st.STATUS_NO_SPEECH,
+    "ready": lambda: st.STATUS_READY,
+    "error_stt": lambda: st.STATUS_ERROR_STT,
+    "error_llm": lambda: st.STATUS_ERROR_LLM,
+    "error_tts": lambda: st.STATUS_ERROR_TTS,
+}
+_STATUS_SLOT_BY_TEXT = {}
+
+
+def _status_slot(text: str) -> str | None:
+    """The URL slot for an allowlisted status, rebuilt lazily so config changes are picked up."""
+    if _STATUS_SLOT_BY_TEXT.get(text) is None:
+        _STATUS_SLOT_BY_TEXT.clear()
+        for slot, getter in _STATUS_SLOTS.items():
+            _STATUS_SLOT_BY_TEXT[getter()] = slot
+    return _STATUS_SLOT_BY_TEXT.get(text)
+
+
 def _get_conversation(device_id: str):
     item = _conversations.get(device_id)
     if item and time.monotonic() - item[1] < CONVERSATION_TTL:
@@ -198,6 +318,47 @@ async def healthz():
     return {"status": "ready"}
 
 
+@app.post("/screen/upload")
+async def screen_upload(request: Request):
+    """Receives a screen snapshot the device pushed (multipart, field "file", JPEG).
+
+    This is how we see what the panel is actually drawing instead of guessing from logs.
+    """
+    form = await request.form()
+    item = form.get("file")
+    data = await item.read() if hasattr(item, "read") else (item or b"")
+    if not data:
+        raise HTTPException(status_code=400, detail="No image")
+    name = os.path.join(SNAPSHOT_DIR, time.strftime("screen_%Y%m%d_%H%M%S.jpg"))
+    with open(name, "wb") as fh:
+        fh.write(data if isinstance(data, bytes) else data.encode("latin1"))
+    logger.info("Screen snapshot saved: %s (%d bytes)", name, len(data))
+    return {"saved": name, "bytes": len(data)}
+
+
+@app.get("/debug/snapshot")
+async def debug_snapshot(request: Request):
+    """Asks every connected device to upload a snapshot of its screen."""
+    base = SCREEN_IMAGE_BASE or f"http://{get_local_ip()}:{SERVER_PORT}"
+    asked = [sid for sid, take in list(_snapshot_takers.items()) if await take(base)]
+    return {"asked": asked, "base": base}
+
+
+@app.get("/screen/{slot}.png")
+async def screen_image_endpoint(slot: str):
+    """A status string drawn as a PNG, for the device's self.screen.preview_image tool.
+
+    Only the allowlisted statuses are reachable — the slot name selects one, so no caller
+    can have arbitrary text drawn on the screen.
+    """
+    getter = _STATUS_SLOTS.get(slot)
+    if getter is None:
+        raise HTTPException(status_code=404, detail="Unknown status")
+    png = await asyncio.to_thread(screen_image.render_status, getter())
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.api_route("/ota/", methods=["GET", "POST"])
 @app.api_route("/ota", methods=["GET", "POST"])
 async def ota_endpoint(request: Request):
@@ -215,21 +376,41 @@ async def ota_endpoint(request: Request):
     device_id = request.headers.get("device-id")
     if device_id:
         _conversations.pop(device_id, None)
+    # Firmware 2.1.4 saves websocket.token to NVS and sends it back as a Bearer
+    # header, so a board only needs its ota_url pointed here once. Boards named in
+    # OTA_DEVICE_TOKENS get their own token; everything else gets the shared one.
+    ota_token = (OTA_DEVICE_TOKENS.get((device_id or "").strip().lower()) or DEVICE_TOKEN or "").strip()
+    if not ota_token and DEVICE_TOKENS:
+        ota_token = next(iter(DEVICE_TOKENS.values()))
 
+    # Firmware 2.1.4 logs "No server_time section found!" without this and leaves
+    # its clock unset. Field names are the ones xiaozhi 1.4.7 already parsed:
+    # timestamp (ms since epoch, UTC), timezone, timezone_offset (minutes).
+    now = datetime.datetime.now(datetime.timezone.utc)
+    offset_min = int(round(TIMEZONE_OFFSET_MIN))
     return JSONResponse(
         content={
             "firmware": {
                 "version": "1.0.0",
                 "url": ""
             },
+            "server_time": {
+                "timestamp": int(now.timestamp() * 1000),
+                "timezone": TIMEZONE_NAME,
+                "timezone_offset": offset_min
+            },
             "websocket": {
                 "url": ws_url,
+                "token": ota_token,
                 "version": 1
             }
         }
     )
 
 
+# Both boards land here: board 2 (SKU lynai, firmware 2.1.4) takes this URL from
+# the /ota/ reply, same as board 1, and speaks the same protocol version 1 with
+# the same opus 16 kHz audio. Verified with board 2 on 2026-11-18.
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     authorization = websocket.headers.get("authorization", "")
@@ -237,14 +418,15 @@ async def websocket_endpoint(websocket: WebSocket):
     if not _runtime_ready():
         await websocket.close(code=1013)
         return
-    if scheme.lower() != "bearer" or not supplied_token or not hmac.compare_digest(supplied_token, DEVICE_TOKEN):
+    device_name = _match_device_token(supplied_token) if scheme.lower() == "bearer" and supplied_token else None
+    if not device_name:
         logger.warning("Rejected unauthenticated WebSocket connection")
         await websocket.close(code=1008)
         return
     await websocket.accept()
     session_id = str(uuid.uuid4())
     device_id = websocket.headers.get("device-id") or "authenticated-device"
-    logger.info("[%s] Authenticated device connected", session_id)
+    logger.info("[%s] Authenticated device connected (%s)", session_id, device_name)
 
     audio_buffer: list[bytes] = []
     is_listening = False
@@ -271,6 +453,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     turn_id = 0  # increments on every new listen/abort; stale pipelines check it and stop
     last_check_packet_count = 0
+    vad_tracker = VadTracker(SAMPLE_RATE)  # decodes each packet once; reset with the buffer
     last_audio_packet_time = asyncio.get_event_loop().time()
     cooldown_until = 0.0
     watchdog_running = True
@@ -301,14 +484,89 @@ async def websocket_endpoint(websocket: WebSocket):
         speech_confirmed = confirmed
         is_listening = False
         processing_queued = True  # block duplicate triggers until the task starts
+        if confirmed:
+            # Say "Thinking..." the moment the pause is detected. Waiting for the WAV repack
+            # and the buffer re-check first left the screen on "Listening..." for a few hundred
+            # ms after the user had stopped, so there was no sign the board had heard them.
+            asyncio.create_task(send_status(st.STATUS_THINKING, "thinking"))
         asyncio.create_task(handle_user_speech())
 
+    # --- MCP (device-side tools) -------------------------------------------------
+    # The 2.x firmware exposes tools over JSON-RPC wrapped in {"type":"mcp","payload":...}
+    # (docs/mcp-protocol.md in the firmware tree). screen.preview_image is a *user-only*
+    # tool, so tools/list must be sent with withUserTools=true or it stays hidden.
+    mcp_next_id = [100]
+    mcp_tools: set[str] = set()
+    last_screen_slot = [None]
+
+    async def mcp_send(method: str, params: dict | None = None) -> int:
+        mcp_next_id[0] += 1
+        await send_json({"session_id": session_id, "type": "mcp", "payload": {
+            "jsonrpc": "2.0", "method": method, "params": params or {}, "id": mcp_next_id[0]}})
+        return mcp_next_id[0]
+
+    async def take_snapshot(base: str) -> bool:
+        if "self.screen.snapshot" not in mcp_tools:
+            return False
+        await mcp_send("tools/call", {"name": "self.screen.snapshot",
+                                      "arguments": {"url": f"{base}/screen/upload", "quality": 80}})
+        return True
+
+    _snapshot_takers[session_id] = take_snapshot
+
+    async def mcp_start():
+        await mcp_send("initialize", {"capabilities": {}})
+        await mcp_send("tools/list", {"cursor": "", "withUserTools": True})
+
+    def mcp_on_payload(payload: dict):
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            if payload.get("error"):
+                logger.warning("[%s] MCP error: %s", session_id, payload["error"])
+            return
+        tools = result.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                name = tool.get("name") if isinstance(tool, dict) else None
+                if name:
+                    mcp_tools.add(name)
+            logger.info("[%s] MCP tools: %s", session_id, ", ".join(sorted(mcp_tools)) or "none")
+            if result.get("nextCursor"):
+                asyncio.create_task(mcp_send(
+                    "tools/list", {"cursor": result["nextCursor"], "withUserTools": True}))
+
+    async def show_status_image(text: str):
+        """Draws the status on the screen through screen.preview_image (see screen_image.py)."""
+        if not SCREEN_IMAGE or "self.screen.preview_image" not in mcp_tools:
+            return
+        slot = _status_slot(text)
+        if slot is None or slot == last_screen_slot[0]:
+            return
+        last_screen_slot[0] = slot
+        url = f"{SCREEN_IMAGE_BASE or f'http://{get_local_ip()}:{SERVER_PORT}'}/screen/{slot}.png"
+        await mcp_send("tools/call", {"name": "self.screen.preview_image",
+                                      "arguments": {"url": url}})
+
     async def send_status(text: str, emotion: str | None = None):
-        """Screen gets only allowlisted status strings — never transcript or answer text."""
+        """Screen gets only allowlisted status strings — never transcript or answer text.
+
+        Two channels put text on the screen (main/application.cc in the 2.x firmware):
+        "stt" lands on the user line (logged as ">>"), tts/sentence_start on the assistant
+        line (logged as "<<"). Board 2's own vendor server used sentence_start, which is how
+        it displayed Thai ("<< สวัสดี" in the 2026-11-17 capture), so that channel is the one
+        proven to render on this board. STATUS_CHANNEL picks: stt, tts, or both.
+        """
         assert text in st.ALLOWED_STATUS, text
-        await send_json({"session_id": session_id, "type": "stt", "text": text})
+        if STATUS_CHANNEL in ("stt", "both"):
+            await send_json({"session_id": session_id, "type": "stt", "text": text})
+        if STATUS_CHANNEL in ("tts", "both"):
+            # sentence_start only sets the chat line; it does not change the device state
+            # (only tts start/stop do), so it is safe to send outside playback.
+            await send_json({"session_id": session_id, "type": "tts",
+                             "state": "sentence_start", "text": text})
         if emotion:
             await send_json({"session_id": session_id, "type": "llm", "emotion": emotion, "text": ""})
+        await show_status_image(text)
 
     async def fail(status: str):
         await send_status(status, "sad")
@@ -335,6 +593,7 @@ async def websocket_endpoint(websocket: WebSocket):
         packets_to_process = list(audio_buffer)
         audio_buffer.clear()
         last_check_packet_count = 0
+        vad_tracker.reset()
 
         def stale() -> bool:
             return my_turn != turn_id or not connected
@@ -387,6 +646,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 await fail(st.STATUS_NO_SPEECH)
                 return
             logger.info("[%s] STT completed in %.1fs", session_id, time.monotonic() - t0)
+            if LOG_TRANSCRIPT:
+                logger.info("[%s] 👤 %s", session_id, transcribed_text)
 
             t_stt = time.monotonic() - t0
 
@@ -402,6 +663,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 async with tts_limit:
                     return await tts_chunk(text)
 
+            answer_parts: list[str] = []
+
             async def producer():
                 nonlocal conversation_id, received_answer, chat_error
                 chunker = st.StreamChunker()
@@ -414,6 +677,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             continue
                         marks.setdefault("token", time.monotonic() - t0)
                         received_answer = True
+                        if LOG_TRANSCRIPT:
+                            answer_parts.append(value)
                         for chunk in chunker.feed(value):
                             marks.setdefault("chunk", time.monotonic() - t0)
                             tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk)))
@@ -425,6 +690,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 except Exception:
                     chat_error = True
                 finally:
+                    # Log the answer as soon as the LLM finished it, not after playback ends,
+                    # so the console shows the exchange while the board is still speaking.
+                    if LOG_TRANSCRIPT and answer_parts:
+                        logger.info("[%s] 🤖 %s", session_id, "".join(answer_parts).strip())
                     tts_tasks.put_nowait(None)
 
             prefetch = asyncio.create_task(producer())
@@ -498,6 +767,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 is_listening = True
                 audio_buffer.clear()
                 last_check_packet_count = 0
+                vad_tracker.reset()
 
     watchdog_task = asyncio.create_task(vad_watchdog())
     try:
@@ -523,22 +793,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     trigger_speech_processing()
                     continue
 
-                # 2. Check for speech and trailing silence once buffer reaches at least 20 packets (~1.2s)
-                # and check every 6 packets (~360ms)
-                if len(audio_buffer) >= 20 and (len(audio_buffer) - last_check_packet_count) >= 6:
+                # 2. Check for speech and trailing silence once the buffer reaches VAD_CHECK_FROM
+                # packets, then every VAD_CHECK_EVERY packets. Only the new packets are decoded.
+                if len(audio_buffer) >= VAD_CHECK_FROM and (len(audio_buffer) - last_check_packet_count) >= VAD_CHECK_EVERY:
                     last_check_packet_count = len(audio_buffer)
                     current_packets = list(audio_buffer)
-                    wav_check = await asyncio.to_thread(opus_packets_to_wav, current_packets, SAMPLE_RATE)
-                    if wav_check:
-                        try:
-                            analysis = check_voice_activity(wav_check)
-                        finally:
-                            del wav_check
+                    ok = await asyncio.to_thread(vad_tracker.feed, current_packets)
+                    if ok:
+                        analysis = vad_tracker.analyze()
                         logger.info(
                             f"[{session_id}] VAD pkts={len(audio_buffer)} rms={analysis['rms']:.0f} "
                             f"speech={analysis.get('overall_speech_ratio', 0)*100:.0f}% "
                             f"trail={analysis.get('trailing_speech_ratio', 0)*100:.0f}% "
                             f"loud={analysis.get('loud_speech_frames', 0)} thr={analysis.get('loud_enough', 0):.0f} "
+                            f"floor={analysis.get('floor', 0):.0f} peak={analysis.get('speech_level', 0):.0f} "
                             f"has_speech={analysis['has_speech']} trailing_silent={analysis['trailing_silent']}"
                         )
                         # Condition A: Speech was detected AND trailing silence detected (>600ms pause)
@@ -557,6 +825,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             # otherwise lose its first words (STT then returns nothing).
                             del audio_buffer[:-KEEP_ON_CLEAR_PACKETS]
                             last_check_packet_count = len(audio_buffer)
+                            vad_tracker.reset()  # frame stats belong to the dropped window
                             await send_status(st.STATUS_READY, "neutral")
                             await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
                             continue
@@ -570,6 +839,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Handshake hello
                     if msg_type == "hello":
                         logger.info("[%s] Device handshake completed", session_id)
+                        if MCP_ENABLE:
+                            asyncio.create_task(mcp_start())
                         await send_json({
                             "type": "hello",
                             "transport": "websocket",
@@ -583,12 +854,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
 
                     # Listen state change
+                    elif msg_type == "mcp":
+                        payload = data.get("payload")
+                        if isinstance(payload, dict):
+                            mcp_on_payload(payload)
+
                     elif msg_type == "listen":
                         state = data.get("state")
                         if state in ["start", "detect"]:
                             cooldown_until = 0.0
                             audio_buffer.clear()
                             last_check_packet_count = 0
+                            vad_tracker.reset()
                             if is_processing or is_speaking:
                                 turn_id += 1  # a new button-initiated listen turn supersedes old output
                                 is_processing = False
@@ -608,6 +885,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         is_speaking = False
                         audio_buffer.clear()
                         last_check_packet_count = 0
+                        vad_tracker.reset()
                         # The board stays in "speaking" until it gets tts stop; without this every
                         # later button press is just another abort and it never listens again.
                         await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
@@ -624,6 +902,7 @@ async def websocket_endpoint(websocket: WebSocket):
         mark_disconnected()
         if _active_sessions.get(device_id, (None,))[0] == session_id:
             _active_sessions.pop(device_id, None)
+        _snapshot_takers.pop(session_id, None)
         watchdog_task.cancel()
         logger.info(f"[{session_id}] Session closed")
 

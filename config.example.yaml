@@ -13,3 +13,13 @@ audio:
   sample_rate: 16000
   frame_duration_ms: 60
   max_speech_sec: 10
+
+# Extra boards. Each gets its own token so one can be revoked alone.
+# DEVICE_TOKEN (env) stays board 1's token.
+devices:
+  board2: "<32-hex token for board 2>"
+
+# Which board a device-id (MAC, lowercase) belongs to. Firmware 2.1.4 stores the
+# token it gets from /ota/ and sends it back as Authorization: Bearer.
+device_ids:
+  "44:bd:8d:7b:39:50": board2

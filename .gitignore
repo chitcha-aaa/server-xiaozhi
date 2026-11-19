@@ -8,3 +8,6 @@ env/
 .ruff_cache/
 *.egg-info/
 config.yaml
+
+# Server logs may contain what the user said when LOG_TRANSCRIPT is on.
+*.log

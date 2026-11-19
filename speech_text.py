@@ -11,10 +11,33 @@ STATUS_ERROR_STT = "Error: speech API"
 STATUS_ERROR_LLM = "Error: AI API"
 STATUS_ERROR_TTS = "Error: voice API"
 STATUS_READY = "Ready"
-ALLOWED_STATUS = {
-    STATUS_LISTENING, STATUS_THINKING, STATUS_SPEAKING, STATUS_NO_SPEECH,
-    STATUS_ERROR_STT, STATUS_ERROR_LLM, STATUS_ERROR_TTS, STATUS_READY,
-}
+_STATUS_NAMES = ("listening", "thinking", "speaking", "no_speech",
+                 "error_stt", "error_llm", "error_tts", "ready")
+
+
+def _rebuild_allowed() -> None:
+    global ALLOWED_STATUS
+    ALLOWED_STATUS = {globals()[f"STATUS_{n.upper()}"] for n in _STATUS_NAMES}
+
+
+ALLOWED_STATUS: set[str] = set()
+_rebuild_allowed()
+
+
+def configure(texts: dict) -> None:
+    """Overrides the on-screen status strings from config (e.g. Thai wording).
+
+    The device font decides what actually renders: a firmware built with a Chinese/Latin
+    font shows missing glyphs as blank boxes, so any non-ASCII wording must be checked on
+    the real screen before it is kept.
+    """
+    if not texts:
+        return
+    for name in _STATUS_NAMES:
+        value = texts.get(name)
+        if isinstance(value, str) and value.strip():
+            globals()[f"STATUS_{name.upper()}"] = value.strip()
+    _rebuild_allowed()
 
 _EMOJI = re.compile(
     "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0000FE0F\U0000200D\U00002B00-\U00002BFF]+"
@@ -51,7 +74,7 @@ class StreamChunker:
     fast TTS = fast first audio). Later chunks are longer so playback stays smooth.
     A leading greeting ("สวัสดีค่ะ ...") is dropped before anything is spoken.
     """
-    FIRST_MIN, FIRST_MAX = 12, 40
+    FIRST_MIN, FIRST_MAX = 8, 28
     NEXT_MIN, NEXT_MAX = 50, 140
     _BREAK = re.compile(r"[\s,.!?;:、。！？\n]")
 
