@@ -42,11 +42,30 @@ def configure(texts: dict) -> None:
 _EMOJI = re.compile(
     "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0000FE0F\U0000200D\U00002B00-\U00002BFF]+"
 )
-_MD = re.compile(r"(\*\*|__|`+|^#+\s*|^\s*[-*•]\s+|^\s*\d+[.)]\s+)", re.M)
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD = re.compile(r"(\*\*|__|`+|[~>]+|^#+\s*|^\s*[-*•]\s+|^\s*\d+[.)]\s+)", re.M)
 _URL = re.compile(r"https?://\S+")
+
+# Thai prepositions/conjunctions that sound unnatural when TTS pauses right after them.
+_HANGING_THAI_WORDS = (
+    "ของ", "ที่", "ใน", "จาก", "กับ", "และ", "หรือ", "เพื่อ",
+    "โดย", "ซึ่ง", "แต่", "ถึง", "ให้", "ว่า", "คือ", "เป็น", "แบบ", "ทาง",
+)
+_THAI_POLITE_END = re.compile(r"(?:นะครับ|นะคะ|ครับ|ค่ะ)")
+
+
+def is_good_clause_break(text_before_break: str) -> bool:
+    """Returns False if the chunk ends with a hanging Thai preposition/conjunction."""
+    stripped = text_before_break.strip()
+    if not stripped:
+        return False
+    return not any(stripped.endswith(w) for w in _HANGING_THAI_WORDS)
 
 
 def clean_for_speech(text: str) -> str:
+    if not text:
+        return ""
+    text = _MD_LINK.sub(r"\1", text)
     text = _URL.sub("", text)
     text = _EMOJI.sub("", text)
     text = _MD.sub("", text)
@@ -87,17 +106,37 @@ class StreamChunker:
         text = self.buf
         if len(text) < lo:
             return None
-        # last break point in [lo, hi]; else first break after lo; else hard cut at hi
+        # Prefer the last natural break in [lo, hi] that doesn't end on a hanging Thai word.
         window = text[:hi + 1]
-        pos = max((m.end() for m in self._BREAK.finditer(window) if m.end() >= lo), default=None)
+        break_positions = [m.end() for m in self._BREAK.finditer(window) if m.end() >= lo]
+        polite_positions = [m.end() for m in _THAI_POLITE_END.finditer(window) if m.end() >= lo]
+        good_positions = [
+            p for p in break_positions if is_good_clause_break(text[:p])
+        ] + polite_positions
+        pos = max(good_positions, default=None)
+
         if pos is None:
-            m = self._BREAK.search(text, lo)
-            if m:
-                pos = m.end()
-            elif len(text) > hi * 2:  # never cut a Thai word unless the run is very long
-                pos = hi * 2
-            else:
-                return None
+            # Look for the first good break beyond hi if buffer is already growing.
+            for m in self._BREAK.finditer(text, lo):
+                if is_good_clause_break(text[:m.end()]):
+                    pos = m.end()
+                    break
+            if pos is None:
+                m_polite = _THAI_POLITE_END.search(text, lo)
+                if m_polite:
+                    pos = m_polite.end()
+        if pos is None:
+            # If we had a break in [lo, hi] (even after a hanging word) and buffer grew past 1.4x hi,
+            # use the last break in text so we don't stall waiting forever.
+            if len(text) >= int(hi * 1.4):
+                any_breaks = [m.end() for m in self._BREAK.finditer(text) if m.end() >= lo]
+                if any_breaks:
+                    pos = any_breaks[-1]
+            if pos is None:
+                if len(text) > hi * 2:  # never cut a Thai word unless the run is very long
+                    pos = hi * 2
+                else:
+                    return None
         chunk, self.buf = text[:pos], text[pos:]
         return chunk
 

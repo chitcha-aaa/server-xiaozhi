@@ -3,16 +3,24 @@ server:
   port: 8000
   public_url: ""
   conversation_ttl_sec: 600
+  # Optional local path to save the last user utterance WAV (off by default).
+  # debug_save_wav_path: ""
 
 langmind:
   base_url: "https://langmind.in.th/api"
   agent_id: ""
   voice_speed: 1.0
+  input_mode: "voice"
 
 audio:
   sample_rate: 16000
   frame_duration_ms: 60
   max_speech_sec: 10
+  # Low-latency streaming & TTS tuning (optional; defaults shown):
+  # tts_concurrency: 2
+  # tts_compression_level: 5
+  # tts_burst_frames: 2
+  # inactivity_timeout_sec: 1.2
 
 # Extra boards. Each gets its own token so one can be revoked alone.
 # DEVICE_TOKEN (env) stays board 1's token.
