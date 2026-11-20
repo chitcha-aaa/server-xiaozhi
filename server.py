@@ -17,8 +17,8 @@ from fastapi.responses import JSONResponse, Response
 import uvicorn
 
 import audio_converter
-from audio_converter import (opus_packets_to_wav, audio_to_opus_packets, check_voice_activity,
-                            VadTracker)
+from audio_converter import (opus_packets_to_pcm, opus_packets_to_wav, audio_to_opus_packets,
+                            check_voice_activity, pcm_to_wav, VadTracker)
 from langmind_client import LangMindClient
 import speech_text as st
 import screen_image
@@ -68,22 +68,38 @@ def get_local_ip() -> str:
         s.close()
 
 
-# Load non-secret configuration. Credentials come from the process environment.
+def _save_debug_wav(path: str, data: bytes) -> None:
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+    except Exception as exc:
+        logger.debug("Failed to save debug WAV to %s: %s", path, exc)
+
+
+APP_ENV = os.environ.get("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+
+# Load configuration. In production, credentials come strictly from environment variables.
+# In local development, fall back to config.local.yaml if config.yaml is absent.
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
+LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.local.yaml")
 if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+elif not IS_PRODUCTION and os.path.exists(LOCAL_CONFIG_PATH):
+    with open(LOCAL_CONFIG_PATH, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
 else:
     config = {}
 
-APP_ENV = os.environ.get("APP_ENV", "development").strip().lower()
-IS_PRODUCTION = APP_ENV == "production"
 SERVER_HOST = config.get("server", {}).get("host", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("PORT") or os.environ.get("XIAOZHI_PORT") or config.get("server", {}).get("port", 8000))
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or config.get("server", {}).get("public_url", "")).strip()
 
 LANGMIND_BASE_URL = os.environ.get("LANGMIND_BASE_URL", config.get("langmind", {}).get("base_url", "https://langmind.in.th/api")).strip()
 LANGMIND_API_KEY = os.environ.get("LANGMIND_API_KEY", "").strip()
+if not LANGMIND_API_KEY and not IS_PRODUCTION:
+    LANGMIND_API_KEY = str(config.get("langmind", {}).get("api_key", "")).strip()
 LANGMIND_AGENT_ID = (os.environ.get("LANGMIND_AGENT_ID") or config.get("langmind", {}).get("agent_id", "")).strip()
 DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "").strip()
 # Clock handed to the board in the /ota/ reply. Defaults to Thailand, since a
@@ -140,6 +156,7 @@ def _match_device_token(supplied: str) -> str | None:
             matched = name
     return matched
 VOICE_SPEED = float(os.environ.get("VOICE_SPEED") or config.get("langmind", {}).get("voice_speed", 1.0))
+LANGMIND_INPUT_MODE = str(config.get("langmind", {}).get("input_mode", "voice")).strip()
 
 SAMPLE_RATE = int(config.get("audio", {}).get("sample_rate", 16000))
 FRAME_DURATION_MS = int(config.get("audio", {}).get("frame_duration_ms", 60))
@@ -147,6 +164,15 @@ FRAME_DURATION_MS = int(config.get("audio", {}).get("frame_duration_ms", 60))
 # 60 ms SILK frames, so TTS is encoded the same way it sends.
 TTS_ENCODE_FRAME_MS = int(config.get("audio", {}).get("tts_encode_frame_ms", 20))
 TTS_BITRATE = str(config.get("audio", {}).get("tts_bitrate", "16k"))
+TTS_COMPRESSION_LEVEL = int(config.get("audio", {}).get("tts_compression_level", 5))
+# Number of concurrent TTS prefetch requests (1 gives Chunk #1 full priority; 2 overlaps more).
+TTS_CONCURRENCY = max(1, int(os.environ.get("TTS_CONCURRENCY") or config.get("audio", {}).get("tts_concurrency", 2)))
+# Burst the first N Opus frames immediately to prime the ESP32 jitter buffer before pacing.
+TTS_BURST_FRAMES = max(0, int(config.get("audio", {}).get("tts_burst_frames", 2)))
+INACTIVITY_TIMEOUT_SEC = float(config.get("audio", {}).get("inactivity_timeout_sec", 1.2))
+# Optional path to save the last user utterance WAV for local debugging (disabled by default).
+DEBUG_SAVE_WAV_PATH = (os.environ.get("DEBUG_SAVE_WAV_PATH")
+                       or config.get("server", {}).get("debug_save_wav_path", "")).strip()
 KEEP_ON_CLEAR_PACKETS = max(1, 1000 // FRAME_DURATION_MS)  # ~1 s kept when a silent window is dropped
 
 # End-of-speech timings. Defaults are tuned for board 2 (lynai); board 1 (zuowei, quiet mic)
@@ -199,9 +225,11 @@ _active_sessions: dict[str, tuple[str, object]] = {}  # device_id -> (session_id
 
 
 def _runtime_ready() -> bool:
-    if not (LANGMIND_API_KEY and LANGMIND_AGENT_ID) or not DEVICE_TOKENS:
+    if not (LANGMIND_API_KEY and LANGMIND_AGENT_ID):
         return False
     if IS_PRODUCTION:
+        if not DEVICE_TOKENS:
+            return False
         parsed = _parse_websocket_url(PUBLIC_URL)
         try:
             langmind_url = urlsplit(LANGMIND_BASE_URL)
@@ -296,12 +324,14 @@ langmind = LangMindClient(
     api_key=LANGMIND_API_KEY,
     agent_id=LANGMIND_AGENT_ID,
     voice_speed=VOICE_SPEED,
+    input_mode=LANGMIND_INPUT_MODE,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Bridge server started; runtime_ready=%s", _runtime_ready())
+    auth_mode = "token" if (DEVICE_TOKENS or IS_PRODUCTION) else "local-no-auth"
+    logger.info("Bridge server started; runtime_ready=%s auth=%s", _runtime_ready(), auth_mode)
     try:
         yield
     finally:
@@ -418,11 +448,14 @@ async def websocket_endpoint(websocket: WebSocket):
     if not _runtime_ready():
         await websocket.close(code=1013)
         return
-    device_name = _match_device_token(supplied_token) if scheme.lower() == "bearer" and supplied_token else None
-    if not device_name:
-        logger.warning("Rejected unauthenticated WebSocket connection")
-        await websocket.close(code=1008)
-        return
+    if DEVICE_TOKENS or IS_PRODUCTION:
+        device_name = _match_device_token(supplied_token) if scheme.lower() == "bearer" and supplied_token else None
+        if not device_name:
+            logger.warning("Rejected unauthenticated WebSocket connection")
+            await websocket.close(code=1008)
+            return
+    else:
+        device_name = "local-dev"
     await websocket.accept()
     session_id = str(uuid.uuid4())
     device_id = websocket.headers.get("device-id") or "authenticated-device"
@@ -454,20 +487,67 @@ async def websocket_endpoint(websocket: WebSocket):
     turn_id = 0  # increments on every new listen/abort; stale pipelines check it and stop
     last_check_packet_count = 0
     vad_tracker = VadTracker(SAMPLE_RATE)  # decodes each packet once; reset with the buffer
-    last_audio_packet_time = asyncio.get_event_loop().time()
+    vad_check_in_progress = False
+    vad_gen = 0  # incremented on every reset so stale background VAD results are ignored
+    loop = asyncio.get_running_loop()
+    last_audio_packet_time = loop.time()
     cooldown_until = 0.0
     watchdog_running = True
 
+    def reset_vad():
+        nonlocal vad_gen
+        vad_gen += 1
+        vad_tracker.reset()
+
     async def vad_watchdog():
         while watchdog_running:
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.15)
             if not watchdog_running:
                 break
-            now = asyncio.get_event_loop().time()
+            now = loop.time()
             if is_listening and len(audio_buffer) >= 8 and not is_processing:
-                if (now - last_audio_packet_time) > 1.2:
+                if (now - last_audio_packet_time) > INACTIVITY_TIMEOUT_SEC:
                     logger.info(f"[{session_id}] ⏱️ Inactivity pause ({len(audio_buffer)} packets buffered). Processing speech...")
                     trigger_speech_processing()
+
+    async def run_background_vad_check(new_packets: list[bytes], snapshot_len: int, my_gen: int):
+        """Runs incremental VAD decode off the WebSocket receive loop so incoming frames never stall."""
+        nonlocal vad_check_in_progress, last_check_packet_count
+        try:
+            pcm = await asyncio.to_thread(opus_packets_to_pcm, new_packets, SAMPLE_RATE)
+            if not pcm or my_gen != vad_gen or not is_listening or is_processing or processing_queued or not connected:
+                return
+            vad_tracker.ingest_pcm(pcm, snapshot_len)
+            analysis = vad_tracker.analyze()
+            logger.info(
+                f"[{session_id}] VAD pkts={len(audio_buffer)} rms={analysis['rms']:.0f} "
+                f"speech={analysis.get('overall_speech_ratio', 0)*100:.0f}% "
+                f"trail={analysis.get('trailing_speech_ratio', 0)*100:.0f}% "
+                f"loud={analysis.get('loud_speech_frames', 0)} thr={analysis.get('loud_enough', 0):.0f} "
+                f"floor={analysis.get('floor', 0):.0f} peak={analysis.get('speech_level', 0):.0f} "
+                f"has_speech={analysis['has_speech']} trailing_silent={analysis['trailing_silent']}"
+            )
+            # Condition A: Speech was detected AND trailing silence detected
+            if analysis["has_speech"] and analysis["trailing_silent"]:
+                logger.info(
+                    f"[{session_id}] 🤫 User finished speaking (RMS={analysis['rms']:.1f}, "
+                    f"Speech={analysis['overall_speech_ratio']*100:.1f}%, TrailingSilence=True). Processing..."
+                )
+                trigger_speech_processing(confirmed=True)
+            # Condition B: Pure silence / no speech at all after 55 packets (~3.3 seconds)
+            elif len(audio_buffer) >= 55 and not analysis["has_speech"]:
+                logger.info(f"[{session_id}] 💤 No voice detected in 3.3s (RMS={analysis['rms']:.1f}). Clearing buffer.")
+                # Keep the last ~1 s: speech that starts just before this check would
+                # otherwise lose its first words (STT then returns nothing).
+                del audio_buffer[:-KEEP_ON_CLEAR_PACKETS]
+                last_check_packet_count = len(audio_buffer)
+                reset_vad()  # frame stats belong to the dropped window
+                await send_status(st.STATUS_READY, "neutral")
+                await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
+        except Exception as exc:
+            logger.debug("[%s] Background VAD check error: %s", session_id, exc)
+        finally:
+            vad_check_in_progress = False
 
     async def send_json(msg: dict):
         if not connected:
@@ -572,12 +652,30 @@ async def websocket_endpoint(websocket: WebSocket):
         await send_status(status, "sad")
         await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
 
-    async def tts_chunk(text: str) -> list[bytes]:
+    async def tts_chunk(text: str, chunk_idx: int = 0) -> list[bytes]:
+        t_c0 = time.monotonic()
         audio = await langmind.speech(text)
         if not audio:
             return []
-        return await asyncio.to_thread(audio_to_opus_packets, audio, SAMPLE_RATE, FRAME_DURATION_MS,
-                                       TTS_ENCODE_FRAME_MS, TTS_BITRATE)
+        opus_pkts = await asyncio.to_thread(
+            audio_to_opus_packets, audio, SAMPLE_RATE, FRAME_DURATION_MS,
+            TTS_ENCODE_FRAME_MS, TTS_BITRATE, TTS_COMPRESSION_LEVEL,
+        )
+        dt_ms = (time.monotonic() - t_c0) * 1000
+        if chunk_idx:
+            if LOG_TRANSCRIPT:
+                logger.info(
+                    "[%s] 🔊 TTS Chunk #%d ready in %.0fms: %d frames (%.1fs) | %s",
+                    session_id, chunk_idx, dt_ms, len(opus_pkts),
+                    len(opus_pkts) * (FRAME_DURATION_MS / 1000.0), text,
+                )
+            else:
+                logger.info(
+                    "[%s] 🔊 TTS Chunk #%d ready in %.0fms: %d frames (%.1fs)",
+                    session_id, chunk_idx, dt_ms, len(opus_pkts),
+                    len(opus_pkts) * (FRAME_DURATION_MS / 1000.0),
+                )
+        return opus_pkts
 
     async def handle_user_speech():
         nonlocal audio_buffer, is_listening, is_speaking, is_processing, conversation_id
@@ -593,7 +691,8 @@ async def websocket_endpoint(websocket: WebSocket):
         packets_to_process = list(audio_buffer)
         audio_buffer.clear()
         last_check_packet_count = 0
-        vad_tracker.reset()
+        cached_pcm, cached_consumed, cached_analysis = vad_tracker.snapshot_pcm()
+        reset_vad()
 
         def stale() -> bool:
             return my_turn != turn_id or not connected
@@ -610,14 +709,30 @@ async def websocket_endpoint(websocket: WebSocket):
         prefetch: asyncio.Task | None = None
 
         try:
-            wav_bytes = await asyncio.to_thread(opus_packets_to_wav, packets_to_process, SAMPLE_RATE)
-            del packets_to_process
+            # Reuse PCM already decoded incrementally by VadTracker to avoid a redundant FFmpeg spawn.
+            wav_bytes = b""
+            reused_exact_analysis = None
+            if cached_pcm and cached_consumed <= len(packets_to_process):
+                tail_packets = packets_to_process[cached_consumed:]
+                if not tail_packets:
+                    wav_bytes = pcm_to_wav(cached_pcm, SAMPLE_RATE)
+                    reused_exact_analysis = cached_analysis
+                else:
+                    tail_pcm = await asyncio.to_thread(opus_packets_to_pcm, tail_packets, SAMPLE_RATE)
+                    if tail_pcm:
+                        wav_bytes = pcm_to_wav(cached_pcm + tail_pcm, SAMPLE_RATE)
+            if not wav_bytes:
+                wav_bytes = await asyncio.to_thread(opus_packets_to_wav, packets_to_process, SAMPLE_RATE)
+            del packets_to_process, cached_pcm
             if not wav_bytes:
                 logger.warning(f"[{session_id}] Could not convert audio to WAV")
                 await fail(st.STATUS_NO_SPEECH)
                 return
 
-            analysis = check_voice_activity(wav_bytes)
+            if DEBUG_SAVE_WAV_PATH:
+                asyncio.create_task(asyncio.to_thread(_save_debug_wav, DEBUG_SAVE_WAV_PATH, wav_bytes))
+
+            analysis = reused_exact_analysis or check_voice_activity(wav_bytes)
             # The whole buffer includes the silence before and after speaking, so its speech ratio
             # is lower than the window the trailing-silence check saw. A quiet mic (RMS 400-900 on
             # the zuowei board) then fails here although speech was found, so trust that check.
@@ -654,20 +769,23 @@ async def websocket_endpoint(websocket: WebSocket):
             # 2+3. Chat streaming -> TTS per chunk as soon as a phrase is ready -> ordered playback.
             # (conversation_id keeps context across turns and reconnects)
             tts_tasks: asyncio.Queue = asyncio.Queue()  # ordered TTS tasks; None = end of answer
-            tts_limit = asyncio.Semaphore(2)            # at most 2 TTS requests in flight
+            tts_limit = asyncio.Semaphore(TTS_CONCURRENCY)
             received_answer = False
             chat_error = False
             marks: dict[str, float] = {}
 
-            async def tts_limited(text: str) -> list[bytes]:
+            async def tts_limited(text: str, chunk_idx: int) -> list[bytes]:
                 async with tts_limit:
-                    return await tts_chunk(text)
+                    if stale():
+                        return []
+                    return await tts_chunk(text, chunk_idx)
 
             answer_parts: list[str] = []
 
             async def producer():
                 nonlocal conversation_id, received_answer, chat_error
                 chunker = st.StreamChunker()
+                chunk_idx = 0
                 try:
                     async for kind, value in langmind.chat_stream(VOICE_PREFIX + transcribed_text, conversation_id):
                         if kind == "conv":
@@ -680,13 +798,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         if LOG_TRANSCRIPT:
                             answer_parts.append(value)
                         for chunk in chunker.feed(value):
+                            chunk_idx += 1
                             marks.setdefault("chunk", time.monotonic() - t0)
-                            tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk)))
+                            if LOG_TRANSCRIPT:
+                                logger.info("[%s] 🧩 LLM Chunk #%d (+%.0fms): %s",
+                                            session_id, chunk_idx, (time.monotonic() - t0) * 1000, chunk)
+                            tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk, chunk_idx)))
                         if stale():
                             return
                     for chunk in chunker.flush():
+                        chunk_idx += 1
                         marks.setdefault("chunk", time.monotonic() - t0)
-                        tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk)))
+                        if LOG_TRANSCRIPT:
+                            logger.info("[%s] 🧩 LLM Chunk #%d (+%.0fms): %s",
+                                        session_id, chunk_idx, (time.monotonic() - t0) * 1000, chunk)
+                        tts_tasks.put_nowait(asyncio.create_task(tts_limited(chunk, chunk_idx)))
                 except Exception:
                     chat_error = True
                 finally:
@@ -700,6 +826,9 @@ async def websocket_endpoint(websocket: WebSocket):
             is_speaking = True
             started = False
             spoken = 0
+            frames_sent = 0
+            frame_duration_sec = FRAME_DURATION_MS / 1000.0
+            next_frame_time = 0.0
             while True:
                 task = await tts_tasks.get()
                 if task is None:
@@ -720,11 +849,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 if not started:
                     started = True
-                    logger.info(f"[{session_id}] 🔊 First audio after {time.monotonic() - t0:.1f}s "
-                                f"(STT {t_stt:.1f}s, first token {marks.get('token', 0):.1f}s, "
+                    ttfa_sec = time.monotonic() - t0
+                    logger.info(f"[{session_id}] 🔊 First audio after {ttfa_sec:.1f}s (TTFA {ttfa_sec*1000:.0f}ms; "
+                                f"STT {t_stt:.1f}s, first token {marks.get('token', 0):.1f}s, "
                                 f"first chunk {marks.get('chunk', 0):.1f}s)")
                     await send_json({"session_id": session_id, "type": "tts", "state": "start"})
                     await send_status(st.STATUS_SPEAKING, "happy")
+                    next_frame_time = loop.time()
                 for pkt in packets:
                     if stale():
                         break
@@ -734,7 +865,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.info("[%s] Device disconnected during playback", session_id)
                         mark_disconnected()
                         break
-                    await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
+                    frames_sent += 1
+                    # Burst the first N frames to prime the ESP32 jitter buffer, then pace drift-free.
+                    if frames_sent <= TTS_BURST_FRAMES:
+                        next_frame_time = loop.time()
+                    else:
+                        next_frame_time += frame_duration_sec
+                        delay = next_frame_time - loop.time()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        elif delay < -0.3:
+                            next_frame_time = loop.time()
             # drop any TTS still queued after an interrupt
             while not tts_tasks.empty():
                 t = tts_tasks.get_nowait()
@@ -767,7 +908,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 is_listening = True
                 audio_buffer.clear()
                 last_check_packet_count = 0
-                vad_tracker.reset()
+                reset_vad()
 
     watchdog_task = asyncio.create_task(vad_watchdog())
     try:
@@ -782,7 +923,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not is_listening or is_speaking or is_processing or time.monotonic() < cooldown_until:
                     continue
 
-                last_audio_packet_time = asyncio.get_event_loop().time()
+                last_audio_packet_time = loop.time()
                 pkt = msg["bytes"]
                 audio_buffer.append(pkt)
 
@@ -793,42 +934,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     trigger_speech_processing()
                     continue
 
-                # 2. Check for speech and trailing silence once the buffer reaches VAD_CHECK_FROM
+                # 2. Non-blocking incremental VAD check once the buffer reaches VAD_CHECK_FROM
                 # packets, then every VAD_CHECK_EVERY packets. Only the new packets are decoded.
-                if len(audio_buffer) >= VAD_CHECK_FROM and (len(audio_buffer) - last_check_packet_count) >= VAD_CHECK_EVERY:
-                    last_check_packet_count = len(audio_buffer)
-                    current_packets = list(audio_buffer)
-                    ok = await asyncio.to_thread(vad_tracker.feed, current_packets)
-                    if ok:
-                        analysis = vad_tracker.analyze()
-                        logger.info(
-                            f"[{session_id}] VAD pkts={len(audio_buffer)} rms={analysis['rms']:.0f} "
-                            f"speech={analysis.get('overall_speech_ratio', 0)*100:.0f}% "
-                            f"trail={analysis.get('trailing_speech_ratio', 0)*100:.0f}% "
-                            f"loud={analysis.get('loud_speech_frames', 0)} thr={analysis.get('loud_enough', 0):.0f} "
-                            f"floor={analysis.get('floor', 0):.0f} peak={analysis.get('speech_level', 0):.0f} "
-                            f"has_speech={analysis['has_speech']} trailing_silent={analysis['trailing_silent']}"
-                        )
-                        # Condition A: Speech was detected AND trailing silence detected (>600ms pause)
-                        if analysis["has_speech"] and analysis["trailing_silent"]:
-                            logger.info(
-                                f"[{session_id}] 🤫 User finished speaking (RMS={analysis['rms']:.1f}, "
-                                f"Speech={analysis['overall_speech_ratio']*100:.1f}%, TrailingSilence=True). Processing..."
-                            )
-                            trigger_speech_processing(confirmed=True)
-                            continue
-
-                        # Condition B: Pure silence / no speech at all after 55 packets (~3.3 seconds)
-                        elif len(audio_buffer) >= 55 and not analysis["has_speech"]:
-                            logger.info(f"[{session_id}] 💤 No voice detected in 3.3s (RMS={analysis['rms']:.1f}). Clearing buffer.")
-                            # Keep the last ~1 s: speech that starts just before this check would
-                            # otherwise lose its first words (STT then returns nothing).
-                            del audio_buffer[:-KEEP_ON_CLEAR_PACKETS]
-                            last_check_packet_count = len(audio_buffer)
-                            vad_tracker.reset()  # frame stats belong to the dropped window
-                            await send_status(st.STATUS_READY, "neutral")
-                            await send_json({"session_id": session_id, "type": "tts", "state": "stop"})
-                            continue
+                if (
+                    len(audio_buffer) >= VAD_CHECK_FROM
+                    and (len(audio_buffer) - last_check_packet_count) >= VAD_CHECK_EVERY
+                    and not vad_check_in_progress
+                ):
+                    snapshot_len = len(audio_buffer)
+                    new_packets = audio_buffer[vad_tracker.consumed:snapshot_len]
+                    if new_packets:
+                        last_check_packet_count = snapshot_len
+                        vad_check_in_progress = True
+                        asyncio.create_task(run_background_vad_check(new_packets, snapshot_len, vad_gen))
 
             # Text JSON message received from ESP32
             elif "text" in msg and msg["text"]:
@@ -865,7 +983,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             cooldown_until = 0.0
                             audio_buffer.clear()
                             last_check_packet_count = 0
-                            vad_tracker.reset()
+                            reset_vad()
                             if is_processing or is_speaking:
                                 turn_id += 1  # a new button-initiated listen turn supersedes old output
                                 is_processing = False
@@ -885,7 +1003,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         is_speaking = False
                         audio_buffer.clear()
                         last_check_packet_count = 0
-                        vad_tracker.reset()
+                        reset_vad()
                         # The board stays in "speaking" until it gets tts stop; without this every
                         # later button press is just another abort and it never listens again.
                         await send_json({"session_id": session_id, "type": "tts", "state": "stop"})

@@ -86,10 +86,11 @@ def make_ogg_page(header_type: int, granule_pos: int, serial: int, seq: int, pac
     return bytes(header) + body
 
 
-def _pcm16_to_wav(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
-    """Wrap raw 16-bit mono PCM bytes in a canonical 44-byte WAV header with exact sizes."""
+def pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
+    """Wrap raw 16-bit signed little-endian PCM bytes in a canonical 44-byte WAV header with exact sizes."""
     data_size = len(pcm_data)
-    byte_rate = sample_rate * 2  # mono 16-bit
+    block_align = channels * 2
+    byte_rate = sample_rate * block_align
     header = struct.pack(
         "<4sI4s4sIHHIIHH4sI",
         b"RIFF",
@@ -98,15 +99,20 @@ def _pcm16_to_wav(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
         b"fmt ",
         16,           # PCM fmt chunk size
         1,            # AudioFormat = 1 (PCM)
-        1,            # NumChannels = 1 (mono)
+        channels,     # NumChannels
         sample_rate,
         byte_rate,
-        2,            # BlockAlign = 2 bytes
+        block_align,  # BlockAlign
         16,           # BitsPerSample = 16
         b"data",
         data_size,
     )
     return header + pcm_data
+
+
+def _pcm16_to_wav(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+    """Wrap raw 16-bit mono PCM bytes in a canonical 44-byte WAV header with exact sizes."""
+    return pcm_to_wav(pcm_data, sample_rate=sample_rate, channels=1)
 
 
 def opus_packets_to_pcm(packets: list[bytes], sample_rate: int = 16000) -> bytes:
@@ -157,7 +163,8 @@ def opus_packets_to_wav(packets: list[bytes], sample_rate: int = 16000) -> bytes
 
 
 def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_duration_ms: int = 60,
-                          encode_frame_ms: int = 0, bitrate: str = "24k") -> list[bytes]:
+                          encode_frame_ms: int = 0, bitrate: str = "24k",
+                          compression_level: int = 5) -> list[bytes]:
     """Takes MP3 or WAV bytes (from LangMind TTS) and converts them to a list of raw Opus packets.
     Each packet covers frame_duration_ms. With encode_frame_ms set (e.g. 20 for 60 ms packets),
     frames are encoded at that size and several are joined per packet."""
@@ -165,6 +172,7 @@ def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_du
         return []
     enc_ms = encode_frame_ms or frame_duration_ms
     pack_frames = frame_duration_ms // enc_ms
+    comp_lvl = max(0, min(10, int(compression_level)))
 
     try:
         res = subprocess.run(
@@ -174,6 +182,8 @@ def audio_to_opus_packets(audio_bytes: bytes, sample_rate: int = 16000, frame_du
                 "-ar", str(sample_rate),
                 "-ac", "1",
                 "-b:a", bitrate,
+                "-vbr", "on",
+                "-compression_level", str(comp_lvl),
                 "-application", "voip",
                 "-frame_duration", str(enc_ms),
                 "-f", "ogg",
@@ -322,12 +332,32 @@ class VadTracker:
         self.frame_vad: list[bool] = []
         self.frame_rms: list[float] = []
         self._tail = b""  # PCM left over from the last decode, shorter than one 20 ms frame
+        self._pcm = bytearray()  # cached decoded PCM so STT can reuse it without re-decoding
 
     def reset(self) -> None:
         self.consumed = 0
         self.frame_vad.clear()
         self.frame_rms.clear()
         self._tail = b""
+        self._pcm.clear()
+
+    def ingest_pcm(self, pcm: bytes, new_consumed: int) -> None:
+        """Appends already-decoded PCM bytes (from a background decode) on the caller's thread."""
+        if not pcm:
+            return
+        self.consumed = new_consumed
+        self._pcm.extend(pcm)
+        buf = self._tail + pcm
+        used = (len(buf) // 640) * 640
+        self._tail = buf[used:]
+        vad, rms = _frame_stats(buf[:used])
+        self.frame_vad.extend(vad)
+        self.frame_rms.extend(rms)
+
+    def snapshot_pcm(self) -> tuple[bytes, int, dict | None]:
+        """Returns (cached_pcm_bytes, consumed_packet_count, current_analysis_or_None)."""
+        analysis = self.analyze() if self.frame_vad else None
+        return bytes(self._pcm), self.consumed, analysis
 
     def feed(self, packets: list[bytes]) -> bool:
         """Decodes the packets added since the last call. False if decoding failed."""
@@ -337,13 +367,7 @@ class VadTracker:
         pcm = opus_packets_to_pcm(new, self.sample_rate)
         if not pcm:
             return False
-        self.consumed = len(packets)
-        buf = self._tail + pcm
-        used = (len(buf) // 640) * 640
-        self._tail = buf[used:]
-        vad, rms = _frame_stats(buf[:used])
-        self.frame_vad.extend(vad)
-        self.frame_rms.extend(rms)
+        self.ingest_pcm(pcm, len(packets))
         return True
 
     def analyze(self) -> dict:

@@ -2,12 +2,29 @@ import asyncio
 import json
 import logging
 import socket
-from typing import Optional, Tuple
+from typing import AsyncGenerator, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
 
+from speech_text import StreamChunker, clean_for_speech, split_for_tts
+
 logger = logging.getLogger("LangMindClient")
+
+
+def clean_text_for_tts(text: str) -> str:
+    """Compatibility helper from feat/low-latency-streaming; delegates to speech_text.clean_for_speech."""
+    return clean_for_speech(text)
+
+
+def split_text_into_chunks(text: str, first_chunk_len: int = 25, next_chunk_len: int = 70) -> list[str]:
+    """Compatibility helper from feat/low-latency-streaming; splits cleaned text into TTS chunks."""
+    cleaned = clean_for_speech(text)
+    if not cleaned:
+        return []
+    if len(cleaned) <= first_chunk_len + 15:
+        return [cleaned]
+    return split_for_tts(cleaned, max_len=max(next_chunk_len, first_chunk_len))
 
 # ---------------------------------------------------------------------------
 # Resilience against a flaky uplink (phone hotspot): DNS lookups for the API
@@ -67,11 +84,13 @@ class LangMindError(RuntimeError):
 
 
 class LangMindClient:
-    def __init__(self, base_url: str, api_key: str, agent_id: str, voice_speed: float = 1.0):
+    def __init__(self, base_url: str, api_key: str, agent_id: str, voice_speed: float = 1.0,
+                 input_mode: Optional[str] = "voice"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.agent_id = agent_id
         self.voice_speed = voice_speed
+        self.input_mode = (input_mode or "").strip()
         host = urlparse(self.base_url).hostname
         if host:
             _cached_hosts.add(host)
@@ -83,13 +102,27 @@ class LangMindClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0, connect=8.0),
-                limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=120),
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=120),
             )
         return self._client
 
     async def aclose(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+    async def close(self) -> None:
+        await self.aclose()
+
+    def _chat_payload(self, query: str, conversation_id: Optional[str]) -> dict:
+        payload = {
+            "agent_id": self.agent_id,
+            "query": query,
+            "conversation_id": conversation_id,
+            "attachment_ids": [],
+        }
+        if self.input_mode:
+            payload["input_mode"] = self.input_mode
+        return payload
 
     def _headers(self) -> dict:
         return {
@@ -140,8 +173,7 @@ class LangMindClient:
     async def chat(self, query: str, conversation_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
         """POST /chat/message/blocking. Raises on API failure (never returns an error text to speak)."""
         url = f"{self.base_url}/chat/message/blocking"
-        payload = {"agent_id": self.agent_id, "query": query,
-                   "conversation_id": conversation_id, "attachment_ids": []}
+        payload = self._chat_payload(query, conversation_id)
         logger.info("Calling LangMind Chat")
         try:
             res = await self._post("Chat", url, json=payload)
@@ -164,8 +196,7 @@ class LangMindClient:
         before any text; retries the connection like _post."""
         url = f"{self.base_url}/chat/message"
         headers = {**self._headers(), "Accept": "text/event-stream"}
-        payload = {"agent_id": self.agent_id, "query": query,
-                   "conversation_id": conversation_id, "attachment_ids": []}
+        payload = self._chat_payload(query, conversation_id)
         logger.info("Calling LangMind Chat stream")
         last = ""
         for attempt in range(len(RETRY_DELAYS) + 1):
@@ -183,20 +214,32 @@ class LangMindClient:
                             if not line.startswith("data:"):
                                 continue
                             raw = line[5:].strip()
-                            if raw == "[DONE]":
+                            if not raw or raw == "[DONE]":
                                 break
                             try:
                                 ev = json.loads(raw)
                             except ValueError:
                                 continue
+                            if not isinstance(ev, dict):
+                                continue
                             kind = ev.get("event")
                             if ev.get("conversation_id"):
                                 yield ("conv", ev["conversation_id"])
-                            if kind == "message" and ev.get("answer"):
-                                got_text = True
-                                yield ("text", ev["answer"])
-                            elif kind in ("error",):
+                            if kind in ("message_end", "done"):
+                                break
+                            if kind == "error":
                                 raise LangMindError("Chat stream provider error")
+                            if kind in ("message", "delta", "", None) or "answer" in ev:
+                                token = (
+                                    ev.get("answer")
+                                    or ev.get("message")
+                                    or ev.get("text")
+                                    or ev.get("content")
+                                    or ""
+                                )
+                                if isinstance(token, str) and token:
+                                    got_text = True
+                                    yield ("text", token)
                         return
             except httpx.HTTPError:
                 if got_text:  # mid-answer drop: keep what was spoken, stop here
@@ -209,12 +252,34 @@ class LangMindClient:
                 await asyncio.sleep(delay)
         raise LangMindError(f"Chat stream {last}")
 
+    async def stream_chat_chunks(
+        self,
+        query: str,
+        conversation_id: Optional[str] = None,
+        first_chunk_min_len: int = 8,
+        next_chunk_min_len: int = 50,
+    ) -> AsyncGenerator[Tuple[str, Optional[str]], None]:
+        """Streams SSE chat tokens and yields cleaned phrase chunks as (chunk_text, conversation_id)."""
+        chunker = StreamChunker()
+        chunker.FIRST_MIN = first_chunk_min_len
+        chunker.FIRST_MAX = max(chunker.FIRST_MAX, first_chunk_min_len + 20)
+        chunker.NEXT_MIN = next_chunk_min_len
+        chunker.NEXT_MAX = max(chunker.NEXT_MAX, next_chunk_min_len + 60)
+        new_conv_id = conversation_id
+        async for kind, value in self.chat_stream(query, conversation_id):
+            if kind == "conv":
+                new_conv_id = value
+                continue
+            for chunk in chunker.feed(value):
+                yield chunk, new_conv_id
+        for chunk in chunker.flush():
+            yield chunk, new_conv_id
+
     async def _chat_stream(self, query: str, conversation_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
         """Fallback to SSE streaming /chat/message if blocking is unavailable."""
         url = f"{self.base_url}/chat/message"
         headers = {**self._headers(), "Accept": "text/event-stream"}
-        payload = {"agent_id": self.agent_id, "query": query,
-                   "conversation_id": conversation_id, "attachment_ids": []}
+        payload = self._chat_payload(query, conversation_id)
         chunks, new_conv_id = [], conversation_id
         try:
             async with self._http().stream("POST", url, headers=headers, json=payload) as response:
@@ -229,7 +294,9 @@ class LangMindClient:
                     except ValueError:
                         continue
                     new_conv_id = ev.get("conversation_id", new_conv_id)
-                    if "message" in ev:
+                    if "answer" in ev:
+                        chunks.append(ev["answer"])
+                    elif "message" in ev:
                         chunks.append(ev["message"])
                     elif "text" in ev:
                         chunks.append(ev["text"])
@@ -239,8 +306,11 @@ class LangMindClient:
 
     async def speech(self, text: str) -> bytes:
         """POST /v1/agents/{agent_id}/voice/speech. Returns b'' on failure (caller shows voice error)."""
+        cleaned = clean_for_speech(text)
+        if not cleaned:
+            return b""
         url = f"{self.base_url}/v1/agents/{self.agent_id}/voice/speech"
-        payload = {"text": text, "speed": self.voice_speed, "format": "wav"}
+        payload = {"text": cleaned, "speed": self.voice_speed, "format": "wav"}
         logger.info("Calling LangMind TTS")
         try:
             res = await self._post("TTS", url, json=payload)
