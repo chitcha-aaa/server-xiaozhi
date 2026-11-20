@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: xiaozhi-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xiaozhi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xiaozhi_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-xiaozhi}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - xiaozhi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xiaozhi} -d ${POSTGRES_DB:-xiaozhi}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xiaozhi-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      PORT: 8000
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-xiaozhi}:${POSTGRES_PASSWORD:-xiaozhi_local_dev}@postgres:5432/${POSTGRES_DB:-xiaozhi}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin1234}
+      LANGMIND_BASE_URL: ${LANGMIND_BASE_URL:-https://langmind.in.th/api}
+      LANGMIND_API_KEY: ${LANGMIND_API_KEY:-}
+      LANGMIND_AGENT_ID: ${LANGMIND_AGENT_ID:-}
+      VOICE_SPEED: ${VOICE_SPEED:-1.0}
+      TIMEZONE: ${TIMEZONE:-Asia/Bangkok}
+      TIMEZONE_OFFSET_MIN: ${TIMEZONE_OFFSET_MIN:-420}
+      MAX_FFMPEG_WORKERS: ${MAX_FFMPEG_WORKERS:-6}
+      LOG_TRANSCRIPT: ${LOG_TRANSCRIPT:-false}
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - xiaozhi_snapshots:/srv/snapshots
+
+volumes:
+  xiaozhi_pgdata:
+  xiaozhi_snapshots:

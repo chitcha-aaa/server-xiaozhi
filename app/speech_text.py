@@ -1,8 +1,8 @@
 """Text helpers for spoken replies: strip non-speakable markup and split into TTS-sized chunks."""
+from dataclasses import dataclass
 import re
 
-# Short English status strings shown on the device screen (sent through the "stt" text channel,
-# which firmware v1.4.x renders as a chat line). Nothing else is ever sent to the screen.
+# Short English status strings shown on the device screen. Nothing else is ever sent to the screen.
 STATUS_LISTENING = "Listening..."
 STATUS_THINKING = "Thinking..."
 STATUS_SPEAKING = "Speaking"
@@ -13,6 +13,46 @@ STATUS_ERROR_TTS = "Error: voice API"
 STATUS_READY = "Ready"
 _STATUS_NAMES = ("listening", "thinking", "speaking", "no_speech",
                  "error_stt", "error_llm", "error_tts", "ready")
+
+
+@dataclass(frozen=True)
+class StatusCatalog:
+    """Immutable allowlist of on-screen status strings (English defaults)."""
+    listening: str = STATUS_LISTENING
+    thinking: str = STATUS_THINKING
+    speaking: str = STATUS_SPEAKING
+    no_speech: str = STATUS_NO_SPEECH
+    error_stt: str = STATUS_ERROR_STT
+    error_llm: str = STATUS_ERROR_LLM
+    error_tts: str = STATUS_ERROR_TTS
+    ready: str = STATUS_READY
+
+    @classmethod
+    def from_dict(cls, texts: dict | None = None, base: "StatusCatalog | None" = None) -> "StatusCatalog":
+        src = base or DEFAULT_STATUS_CATALOG
+        if not texts:
+            return src
+        kwargs = {}
+        for name in _STATUS_NAMES:
+            val = texts.get(name)
+            kwargs[name] = val.strip() if isinstance(val, str) and val.strip() else getattr(src, name)
+        return cls(**kwargs)
+
+    @property
+    def allowed(self) -> frozenset[str]:
+        return frozenset(getattr(self, n) for n in _STATUS_NAMES)
+
+    def text_for_slot(self, slot: str) -> str | None:
+        return getattr(self, slot, None) if slot in _STATUS_NAMES else None
+
+    def slot_for_text(self, text: str) -> str | None:
+        for name in _STATUS_NAMES:
+            if getattr(self, name) == text:
+                return name
+        return None
+
+
+DEFAULT_STATUS_CATALOG = StatusCatalog()
 
 
 def _rebuild_allowed() -> None:

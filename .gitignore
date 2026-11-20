@@ -13,3 +13,11 @@ config.local.yaml
 
 # Server logs may contain what the user said when LOG_TRANSCRIPT is on.
 *.log
+
+# React Admin UI build artifacts
+admin-ui/node_modules/
+admin-ui/dist/
+
+# Local secrets & snapshots
+.env
+snapshots/
