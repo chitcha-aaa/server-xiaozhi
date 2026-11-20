@@ -3,23 +3,66 @@ server:
   port: 8000
   public_url: ""
   conversation_ttl_sec: 600
+  max_ffmpeg_workers: 6
+
+# PostgreSQL connection string (prefer env DATABASE_URL in production).
+# Start local Postgres with: docker compose up -d
+database:
+  url: "postgresql://xiaozhi:xiaozhi_local_dev@127.0.0.1:5432/xiaozhi"
+
+# Admin Dashboard password (prefer env ADMIN_PASSWORD in production).
+admin:
+  password: ""
 
 langmind:
   base_url: "https://langmind.in.th/api"
   agent_id: ""
   voice_speed: 1.0
 
-audio:
-  sample_rate: 16000
-  frame_duration_ms: 60
-  max_speech_sec: 10
+# Hardware/firmware profiles. Each board in `devices:` picks a profile so
+# different board models keep their own mic VAD and screen settings while
+# sharing one server and one LangMind agent. Status text defaults to English.
+profiles:
+  default:
+    audio:
+      sample_rate: 16000
+      frame_duration_ms: 60
+      tts_encode_frame_ms: 20
+      tts_bitrate: "16k"
+      max_speech_sec: 10
+    vad:
+      trailing_silence_ms: 800
+      min_loud_speech_ms: 600
+      trailing_rel_level: 0.15
+      trailing_min_rms: 150
+      aggressiveness: 2
+      check_every_packets: 3
+      check_min_packets: 10
+    screen:
+      status_channel: "stt"
+      screen_image: false
+      size: [240, 240]
+      mcp: false
 
-# Extra boards. Each gets its own token so one can be revoked alone.
-# DEVICE_TOKEN (env) stays board 1's token.
+  lynai:
+    vad:
+      trailing_silence_ms: 500
+      min_loud_speech_ms: 400
+      trailing_rel_level: 0.35
+      aggressiveness: 3
+    screen:
+      status_channel: "tts"
+      screen_image: true
+      size: [240, 240]
+      mcp: true
+
+# Registered boards (Phase 1: up to 10+ boards).
+# Keep secrets out of git: pass tokens via env DEVICE_TOKENS="board2:<32+char>,..."
+# and DEVICE_TOKEN (for board1), or put local-only tokens in gitignored config.yaml.
 devices:
-  board2: "<32-hex token for board 2>"
-
-# Which board a device-id (MAC, lowercase) belongs to. Firmware 2.1.4 stores the
-# token it gets from /ota/ and sends it back as Authorization: Bearer.
-device_ids:
-  "44:bd:8d:7b:39:50": board2
+  board1:
+    mac: "34:cd:b0:b4:64:b0"
+    profile: "default"
+  board2:
+    mac: "44:bd:8d:7b:39:50"
+    profile: "lynai"

@@ -20,8 +20,12 @@ import time
 import websockets
 import yaml
 
-from audio_converter import audio_to_opus_packets, opus_packets_to_wav
-from speech_text import ALLOWED_STATUS
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from app.audio_converter import audio_to_opus_packets, opus_packets_to_wav
+from app.speech_text import ALLOWED_STATUS
 
 for _s in (sys.stdout, sys.stderr):
     try:

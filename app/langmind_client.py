@@ -67,23 +67,37 @@ class LangMindError(RuntimeError):
 
 
 class LangMindClient:
-    def __init__(self, base_url: str, api_key: str, agent_id: str, voice_speed: float = 1.0):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        voice_speed: float = 1.0,
+        max_connections: int = 40,
+        max_keepalive_connections: int = 20,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.agent_id = agent_id
         self.voice_speed = voice_speed
+        self._max_connections = max_connections
+        self._max_keepalive_connections = max_keepalive_connections
         host = urlparse(self.base_url).hostname
         if host:
             _cached_hosts.add(host)
-        # One shared client: keeps TLS connections alive between turns, so most
-        # requests need no new DNS lookup or handshake at all.
+        # One shared client: keeps TLS connections alive between turns across all boards,
+        # so most requests need no new DNS lookup or handshake at all.
         self._client: Optional[httpx.AsyncClient] = None
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0, connect=8.0),
-                limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=120),
+                limits=httpx.Limits(
+                    max_connections=self._max_connections,
+                    max_keepalive_connections=self._max_keepalive_connections,
+                    keepalive_expiry=120,
+                ),
             )
         return self._client
 

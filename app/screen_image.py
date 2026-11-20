@@ -14,7 +14,10 @@ import logging
 import os
 from io import BytesIO
 
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None  # type: ignore[assignment]
 
 logger = logging.getLogger("ScreenImage")
 
@@ -31,10 +34,10 @@ _FONT_CANDIDATES = (
     r"C:\Windows\Fonts\tahoma.ttf",
     "/usr/share/fonts/truetype/tlwg/Loma.ttf",
 )
-_cache: dict[tuple[str, int, int], bytes] = {}
+_cache: dict[tuple[str, int, int, int], bytes] = {}
 
 
-def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _font(size: int):
     for path in _FONT_CANDIDATES:
         if os.path.exists(path):
             try:
@@ -47,7 +50,9 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
 def render_status(text: str, size: tuple[int, int] = SIZE, font_size: int = 44) -> bytes:
     """Returns PNG bytes with the text centred. Results are cached per text/size."""
-    key = (text, size[0], font_size)
+    if Image is None:
+        raise RuntimeError("Pillow is required for screen_image rendering (pip install pillow)")
+    key = (text, size[0], size[1], font_size)
     if key in _cache:
         return _cache[key]
 
